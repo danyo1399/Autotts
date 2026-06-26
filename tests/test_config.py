@@ -28,6 +28,28 @@ def test_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.log_level == "debug"
 
 
+def test_settings_loads_remaining_keys_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STT_API_KEY", "secret-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("WHISPER_DEVICE", "cuda")
+    settings = Settings()
+    assert settings.stt_api_key == "secret-key"
+    assert settings.openai_api_key == "sk-test"
+    assert settings.whisper_device == "cuda"
+
+
+@pytest.mark.parametrize("level", ["debug", "info", "warning", "error", "critical"])
+def test_log_level_accepts_valid_values(level: str) -> None:
+    settings = Settings(log_level=level)  # type: ignore[arg-type]
+    assert settings.log_level == level
+
+
+def test_settings_ignores_extra_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UNRELATED_STT_VAR", "noise")
+    settings = Settings()
+    assert settings.whisper_model == "base"
+
+
 def test_log_level_rejects_invalid_value() -> None:
     with pytest.raises(ValidationError):
         Settings(log_level="invalid")  # type: ignore[arg-type]
