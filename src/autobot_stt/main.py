@@ -1,7 +1,9 @@
 import uvicorn
 from fastapi import FastAPI
 
-app = FastAPI(title="autobot-stt", version="0.1.0")
+from autobot_stt import __version__
+
+app = FastAPI(title="autobot-stt", version=__version__)
 
 
 @app.get("/health")
