@@ -26,6 +26,7 @@ packages = ["src/autobot_stt"]
 [dependency-groups]
 dev = [
     "pytest",
+    "pytest-asyncio",
     "httpx",
     "ruff",
 ]
@@ -39,3 +40,4 @@ select = ["E", "F", "I", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"

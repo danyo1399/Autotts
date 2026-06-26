@@ -5,7 +5,7 @@ from autobot_stt import __version__
 from autobot_stt.main import app
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_health_returns_ok() -> None:
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -16,7 +16,7 @@ async def test_health_returns_ok() -> None:
     assert response.json() == {"status": "ok"}
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_health_returns_json_content_type() -> None:
     async with AsyncClient(
         transport=ASGITransport(app=app),
