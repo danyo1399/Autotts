@@ -1,6 +1,6 @@
 [project]
 name = "autobot-stt"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Speech-to-text API for Autobot voice input"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,6 +16,9 @@ autobot-stt = "autobot_stt.main:run"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/autobot_stt/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/autobot_stt"]

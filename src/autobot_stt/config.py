@@ -1,4 +1,9 @@
+from functools import lru_cache
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+LogLevel = Literal["debug", "info", "warning", "error", "critical"]
 
 
 class Settings(BaseSettings):
@@ -12,8 +17,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     whisper_model: str = "base"
     whisper_device: str = "cpu"
-    log_level: str = "info"
+    log_level: LogLevel = "info"
 
 
+@lru_cache
 def get_settings() -> Settings:
     return Settings()
