@@ -1,8 +1,7 @@
 # autobot-stt
 
 Speech-to-text (STT) API for Autobot voice input. Built with FastAPI and
-designed to stream microphone audio to text via REST and WebSocket endpoints
-(coming in later subtasks).
+designed to stream microphone audio to text via REST and WebSocket endpoints.
 
 ## Prerequisites
 
@@ -59,20 +58,24 @@ src/autobot_stt/
 │   ├── auth.py             # verify_api_key (Bearer auth on /v1/*)
 │   └── store.py            # get_session_store (app.state singleton)
 └── routes/
-    └── sessions.py      # POST /v1/sessions, DELETE /v1/sessions/{id}, POST /v1/sessions/{id}/finalize
+    ├── sessions.py         # POST /v1/sessions, DELETE /v1/sessions/{id}, POST /v1/sessions/{id}/finalize
+    └── stream.py           # WS /v1/sessions/{id}/stream — live transcription
 tests/
 ├── fixtures/
-│   └── sample.webm              # tiny WebM/Opus clip for decoder tests
-├── conftest.py                  # shared fixtures: client, store override, auth_headers
-├── test_health.py               # async health endpoint tests (httpx.AsyncClient)
-├── test_config.py               # settings defaults, env loading, LogLevel validation
-├── test_app.py                  # OpenAPI schema, run(), lifespan wiring tests
-├── test_audio_decoder.py        # audio decoder success, sample rate, error paths
-├── test_sessions.py             # POST/DELETE session REST contract
-├── test_auth.py                 # Bearer auth enforcement on /v1/*
-├── test_whisper_service.py      # build_initial_prompt + mocked transcribe tests
+│   └── sample.webm               # tiny WebM/Opus clip for decoder tests
+├── conftest.py                   # shared fixtures: client, store override, auth_headers
+├── test_health.py                # async health endpoint tests (httpx.AsyncClient)
+├── test_config.py                # settings defaults, env loading, LogLevel validation
+├── test_app.py                   # OpenAPI schema, run(), lifespan wiring tests
+├── test_audio_decoder.py         # audio decoder success, sample rate, error paths
+├── test_sessions.py              # POST/DELETE session REST contract
+├── test_auth.py                  # Bearer auth enforcement on /v1/*
+├── test_dependencies_auth.py     # WebSocket auth helpers: token extraction, key validation
+├── test_dependencies_store.py    # DI accessors: session store, whisper service/lock errors
+├── test_stream.py                # WebSocket streaming endpoint integration tests
+├── test_whisper_service.py       # build_initial_prompt + mocked transcribe tests
 ├── test_preload_whisper_model.py # GPU build-time preload script (cache check, CPU/int8)
-└── test_docker_config.py        # docker-compose / Dockerfile / .dockerignore integration
+└── test_docker_config.py         # docker-compose / Dockerfile / .dockerignore integration
 ```
 
 ## Test
@@ -93,9 +96,12 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
 | `test_finalize.py` | LLM finalize endpoint: success, 400/404/502/503, session deletion (incl. preserved on OpenAI error), empty-text response, OpenAI payload, `cleanup_transcript` unit tests (whitespace strip, empty choices, None content, error propagation, api_key + timeout passthrough, empty-context placeholders) |
 | `test_auth.py` | Bearer auth enforced on `/v1/*` when `STT_API_KEY` set; skipped when empty |
+| `test_dependencies_auth.py` | `_extract_ws_token` precedence/normalization, `check_ws_api_key` bypass/match/reject |
+| `test_dependencies_store.py` | `get_session_store` happy path, `get_whisper_service`/`get_whisper_lock` happy + `RuntimeError` on missing state |
 | `test_whisper_service.py` | `build_initial_prompt` logic, mocked `WhisperModel.load`/`transcribe`, beam size/VAD kwargs, empty/multi-dim input handling |
 | `test_preload_whisper_model.py` | GPU build-time preload: `_expected_cache_dir()` paths, `main()` CPU/int8 hardcoding, cache-miss exit code |
 | `test_docker_config.py` | `docker-compose.yml` shape, `Dockerfile` / `Dockerfile.gpu` defaults and preload ordering, `.dockerignore` patterns, real `docker compose config` validation |
+| `test_stream.py` | WebSocket streaming: `ready` handshake, partial transcripts (incremental + cumulative), auth (4401, query-token, Bearer-header, key-empty bypass), 4404 unknown session, decode/ffmpeg/whisper error events, threshold-gated flushes, text-frame ignore, silence-timeout no-op |
 
 ## Lint
 
@@ -321,8 +327,76 @@ and meaning from chat history and comments.
 ### Authentication
 
 - Header: `Authorization: Bearer <STT_API_KEY>`
-- Applied to all `/v1/*` routes. `/health`, `/docs`, `/openapi.json` remain open.
+- Applied to REST routes under `/v1/*`. `/health`, `/docs`, `/openapi.json`, and
+  the WebSocket stream route remain open at the router level — the stream
+  handler enforces auth itself (see below).
 - Missing or wrong token returns `401 Unauthorized`.
+
+## WebSocket streaming
+
+Live transcription is exposed as a WebSocket endpoint. Clients send binary
+WebM/Opus chunks (as produced by a browser `MediaRecorder`); the server
+decodes, runs Whisper incrementally, emits partial transcript events, and
+accumulates the full transcript on the session.
+
+### Connect
+
+```
+WS /v1/sessions/{session_id}/stream?token=<STT_API_KEY>
+```
+
+Authentication accepts either:
+
+- `token` query parameter, **or**
+- `Authorization: Bearer <STT_API_KEY>` header
+
+When `STT_API_KEY` is empty/unset, auth is skipped (dev mode). On auth
+failure the server closes the socket with code **4401** before sending any
+messages; an unknown `session_id` closes with code **4404**.
+
+### Server → client messages (JSON text frames)
+
+```json
+{ "type": "ready", "session_id": "..." }
+{ "type": "partial_transcript", "text": "...", "is_final": false }
+{ "type": "error", "message": "..." }
+```
+
+`partial_transcript.text` is the **cumulative** `session.raw_transcript`
+after each transcription pass; `is_final` is always `false` in this subtask
+(finalization is subtask 7).
+
+### Client → server
+
+Binary frames only — WebM/Opus audio chunks from `MediaRecorder`. Text
+frames are ignored.
+
+### Streaming behavior
+
+The server buffers incoming WebM bytes. Every ~2 seconds of decoded audio
+(or after a 1.5 s silence window with no new chunks), it decodes the batch,
+runs Whisper under a process-wide `asyncio.Lock` (the model is not safe for
+parallel calls), appends the new text to `session.raw_transcript`, and
+emits a `partial_transcript` event. Decode and transcribe run in
+`asyncio.to_thread` so the event loop is not blocked.
+
+The transcript read-modify-write happens **inside** the same lock, so two
+concurrent connections to the same session cannot interleave appends and
+lose text.
+
+On client disconnect the session and accumulated transcript are preserved;
+finalization happens via the REST API in subtask 7.
+
+### Deployment caveats
+
+- **API key in URL.** The `?token=<STT_API_KEY>` query string lands in
+  access logs (uvicorn, reverse proxies) and browser history. Prefer the
+  `Authorization: Bearer ...` header when the client supports it, and
+  suppress or redact query strings from production access logs.
+- **Single-process only.** `asyncio.Lock` and `InMemorySessionStore` are
+  per-process. `uvicorn --workers N` runs N independent states; the
+  Whisper lock and session dict are not shared across workers. Subtask 7
+  externalizes session state before horizontal scaling is meaningful.
 
 ## Configuration
 

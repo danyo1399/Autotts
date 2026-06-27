@@ -221,7 +221,7 @@ async def verify_api_key(
         return  # dev mode — auth skipped
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Unauthorized")
-    if credentials.credentials != settings.stt_api_key:
+    if not _keys_match(credentials.credentials, settings.stt_api_key):
         raise HTTPException(status_code=401, detail="Unauthorized")
 ```
 
@@ -231,12 +231,242 @@ Notes:
   consistent body when the header is missing.
 - The error detail is always `"Unauthorized"` — we do not leak whether the
   header was missing, the scheme was wrong, or the key differed.
+- Both REST and WebSocket auth use the `_keys_match` helper for constant-time
+  comparison (see the [WebSocket auth](#websocket-auth-separate-from-rest-bearer)
+  section below for the implementation).
 - When `STT_API_KEY` is empty/unset, auth is bypassed entirely. This is
   local-dev convenience only; production must set a non-empty key.
 - Auth tests mutate `STT_API_KEY` via `monkeypatch.setenv` and clear the
   `get_settings` cache (`get_settings.cache_clear()`) so the new value is
   picked up. The `conftest._clear_settings_cache` autouse fixture clears
   the cache before and after every test to prevent leakage.
+
+## WebSocket auth (separate from REST Bearer)
+
+The WebSocket stream route (`routes/stream.py`) cannot share the router-scoped
+`verify_api_key` dependency: WS clients authenticate via `?token=` query
+parameter (or `Authorization` header in the handshake), and failure must
+surface as a close frame (code 4401), not an HTTP 401.
+
+**Why:** REST auth raises `HTTPException(401)` from a `Depends` chain that
+runs after the request has been fully received. A WebSocket handshake has to
+choose between `accept()` (proceed) and `close(code=...)` (reject) before
+any application-level messages flow, so the handler must run its own check
+and close with a WS-specific code.
+
+**How:**
+
+- `v1_router` is split: REST routes (`sessions_router`) keep
+  `dependencies=[Depends(verify_api_key)]`; the stream route is mounted on
+  `v1_router` without router-level auth.
+- `dependencies/auth.py::check_ws_api_key(websocket, token, settings) -> bool`
+  is called as a plain function (not via `Depends`) at the top of the
+  handler. Returning `False` triggers `await websocket.close(code=4401)`.
+- Unknown sessions close with code `4404`.
+- When `STT_API_KEY` is empty, `check_ws_api_key` returns `True` and the
+  handler proceeds (dev mode parity with REST).
+- Both the REST and WS paths compare keys with `hmac.compare_digest` (via
+  the `_keys_match` helper) to avoid a timing side-channel on API-key guessing.
+
+### `_keys_match` — constant-time comparison
+
+The `_keys_match` helper wraps `hmac.compare_digest` with a `None` guard,
+since `compare_digest` requires both arguments to be the same type:
+
+```python
+def _keys_match(provided: str | None, expected: str) -> bool:
+    if provided is None:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+```
+
+The `None` check is essential: a missing credential must short-circuit rather
+than passing `None` to `.encode()`. Both sides are UTF-8 encoded so Unicode
+keys compare correctly.
+
+### `_extract_ws_token` — credential source precedence
+
+WebSocket clients authenticate via `?token=` query param **or**
+`Authorization: Bearer` header. Query param wins when both are present:
+
+```python
+def _extract_ws_token(websocket: WebSocket, token: str | None) -> str | None:
+    if token:
+        return token
+    auth = websocket.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[len("bearer "):].strip()
+    return None
+```
+
+The `"bearer "` prefix length is expressed as `len("bearer ")` rather than
+a magic number `7`, so the intent is self-documenting and survives scheme
+changes. The scheme comparison is case-insensitive (`startswith` on `.lower()`).
+
+### Query-string token exposure (deployment caveat)
+
+The `?token=<STT_API_KEY>` contract is locked by the spec, but a query
+string is recorded alongside the request line in many default access logs
+(uvicorn's access log, nginx/ALB access logs, browser history). Mitigations:
+
+- Prefer the `Authorization: Bearer ...` header when the client can set
+  headers on the WS handshake (the server accepts both).
+- In production, suppress or filter query strings from access logs (e.g.
+  `--no-access-log`, or a log formatter that redacts `?token=`).
+
+## Blocking work off the event loop (`asyncio.to_thread`)
+
+`decode_webm_opus_to_pcm` shells out to ffmpeg (subprocess) and
+`WhisperService.transcribe` runs CPU/GPU inference. Both are synchronous
+and would block the event loop, starving other WebSocket connections.
+
+**Why:** FastAPI/Starlette runs the handler on a single event loop; a
+blocking call inside a handler stalls every concurrent request. The decode
+and transcribe calls are offloaded to a worker thread via
+`asyncio.to_thread`, yielding control back to the loop between operations.
+
+**How:** The stream handler wraps the calls:
+
+```python
+pcm = await asyncio.to_thread(decode_webm_opus_to_pcm, batch)
+async with app.state.whisper_lock:
+    text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
+```
+
+`faster-whisper`'s model instance is not safe for concurrent transcribe
+calls, so an `asyncio.Lock` (`app.state.whisper_lock`, created in lifespan)
+serializes access across connections.
+
+**Multi-worker caveat.** `asyncio.Lock` is per-process. Deploying behind
+`uvicorn --workers N` (or any pre-fork model) loads the Whisper model once
+per worker, each with its own lock. That is correct — the model is not
+shared across processes, so no cross-worker lock is needed — but operators
+should not expect `app.state.whisper_lock` to serialize work across
+workers. Each worker also holds its own `session_store`; subtask 7 will
+need to externalize state before horizontal scaling is meaningful.
+
+### Whisper service/lock DI accessors
+
+The stream handler receives `WhisperService` and `asyncio.Lock` via
+`Depends()` helpers in `dependencies/store.py`, not by reaching into
+`request.app.state` inside the handler:
+
+```python
+def get_whisper_service(conn: HTTPConnection) -> WhisperService:
+    service = getattr(conn.app.state, "whisper_service", None)
+    if service is None:
+        raise RuntimeError("Whisper service is not initialized on app.state")
+    return service
+
+def get_whisper_lock(conn: HTTPConnection) -> asyncio.Lock:
+    lock = getattr(conn.app.state, "whisper_lock", None)
+    if lock is None:
+        raise RuntimeError("Whisper lock is not initialized on app.state")
+    return lock
+```
+
+**Why:** Keeps the stream handler focused on protocol logic. The `RuntimeError`
+surfaces missing-lifespan-wiring early with a clear message, rather than an
+opaque `AttributeError` at the first transcribe call. See also
+[`HTTPConnection` for WS-safe DI](#httpconnection-for-websocket-safe-dependency-injection)
+below.
+
+### Transcript mutation within `whisper_lock`
+
+The `_transcribe_and_emit` function holds `whisper_lock` across **both** the
+`whisper.transcribe()` call **and** the `session.raw_transcript`
+read-modify-write, not just the model call:
+
+```python
+async with whisper_lock:
+    text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
+    if not text:
+        return
+    if session.raw_transcript:
+        session.raw_transcript += " "
+    session.raw_transcript += text
+    session.partial_transcripts.append(text)
+    cumulative = session.raw_transcript
+```
+
+**Why:** If the transcribe call were inside the lock but the transcript
+update were after releasing it, two concurrent WebSocket connections to the
+same session could interleave their appends. One connection's output would be
+overwritten. Locking the entire critical section makes the mutation
+unambiguously safe — no `await` in the mutation today keeps it atomic under
+the GIL, but the lock guarantees safety even if a future `await` is inserted
+between the read and write.
+
+## `HTTPConnection` for WebSocket-safe dependency injection
+
+Dependency accessors used by both HTTP and WebSocket routes must type
+their parameter as `HTTPConnection` (from Starlette), not `Request`.
+
+**Why:** WebSocket connections are not `Request` objects. A dependency
+declared with `def get_x(request: Request) -> X` raises
+`AttributeError` when FastAPI tries to inject it into a WebSocket route
+handler. `HTTPConnection` is the common parent of both `Request` and
+`WebSocket`, so it resolves correctly for both.
+
+**How:**
+
+```python
+from starlette.requests import HTTPConnection
+
+def get_session_store(conn: HTTPConnection) -> SessionStore:
+    return conn.app.state.session_store
+```
+
+The `dependencies/store.py` module uses this pattern for all three
+injectors (`get_session_store`, `get_whisper_service`,
+`get_whisper_lock`).
+
+## WebSocket streaming flush logic
+
+The stream handler (`routes/stream.py`) buffers incoming binary WebM
+frames and decides when to decode + transcribe using two thresholds and
+a silence timeout.
+
+**Why:** Sending every 50 ms Opus frame to ffmpeg+Whisper would pin the
+CPU without improving accuracy. Whisper performs best on a few seconds of
+audio at once. The thresholds batch small frames into ~2 s windows while
+still flushing promptly when the speaker pauses.
+
+**How:**
+
+- `STREAM_MIN_BYTES_FOR_DECODE = 1024` — byte threshold below which
+  `flush(force=False)` is a no-op. Guards against tiny initial frames.
+- `STREAM_FLUSH_SAMPLES = STREAM_CHUNK_SECONDS * PCM_SAMPLE_RATE` —
+  sample threshold that triggers transcription after decode. Default
+  `2 * 16000 = 32000` samples ≈ 2 s of audio.
+- `STREAM_SILENCE_TIMEOUT_SECONDS = 1.5` — `asyncio.wait_for` wraps
+  `websocket.receive()`; on `TimeoutError` the handler calls
+  `flush(force=True)` to drain whatever has accumulated.
+
+`flush(force=...)` decodes the buffered WebM bytes to PCM, then either
+calls `_transcribe_and_emit` (when the threshold is met or `force=True`)
+or returns early to wait for more audio. The WebM buffer is cleared as
+soon as a successful decode is consumed by the transcribe step.
+
+**Partial decode deferral.** An `AudioDecodeError` during a non-forced
+flush does not close the connection — the handler logs at `DEBUG` level
+and returns, waiting for more bytes. This is necessary because
+`MediaRecorder` fragments may not be valid WebM independently; they only
+form a valid stream once enough chunks have accumulated. On a forced
+flush (silence timeout or disconnect), the same error is reported to the
+client as `{"type": "error", "message": "Failed to decode audio"}`.
+`FileNotFoundError` (ffmpeg missing) is always reported immediately.
+
+`_build_initial_prompt(session)` is computed **once per connection** from
+`session.draft_text` + `session.chat_history` via
+`services.whisper_service.build_initial_prompt`, then reused for every
+transcribe call on that connection.
+
+The cumulative `session.raw_transcript` is updated inside
+`_transcribe_and_emit`: new text is appended with a separating space, the
+same text is pushed onto `session.partial_transcripts`, and the entire
+`raw_transcript` is sent in each `partial_transcript` event (`is_final`
+is always `false` in this subtask — finalization is subtask 7).
 
 ## Pydantic schemas vs. domain models
 
