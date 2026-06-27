@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -190,6 +190,7 @@ async def test_finalize_mock_receives_context(
 @pytest.mark.asyncio
 async def test_cleanup_transcript_calls_openai_with_expected_payload(monkeypatch) -> None:
     from datetime import UTC, datetime
+    from types import SimpleNamespace
 
     from autobot_stt.models.session import ChatMessage, Comment, Session
     from autobot_stt.services import llm_cleanup
@@ -203,31 +204,14 @@ async def test_cleanup_transcript_calls_openai_with_expected_payload(monkeypatch
         raw_transcript="hello whisper",
     )
 
-    fake_message = type(
-        "Msg",
-        (),
-        {"message": type("Content", (), {"content": "corrected output"})()},
-    )()
-    fake_choice = type("Choice", (), {"message": fake_message.message})()
-    fake_response = type("Resp", (), {"choices": [fake_choice]})()
-
+    fake_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="corrected output"))]
+    )
     create_mock = AsyncMock(return_value=fake_response)
+    client_mock = MagicMock()
+    client_mock.chat.completions.create = create_mock
 
-    class FakeAsyncOpenAI:
-        def __init__(self, *args, **kwargs) -> None:
-            self.chat = type(
-                "Chat",
-                (),
-                {
-                    "completions": type(
-                        "Completions",
-                        (),
-                        {"create": create_mock},
-                    )()
-                },
-            )()
-
-    with patch.object(llm_cleanup, "AsyncOpenAI", FakeAsyncOpenAI):
+    with patch.object(llm_cleanup, "AsyncOpenAI", return_value=client_mock):
         result = await llm_cleanup.cleanup_transcript(session, api_key="sk-test")
 
     assert result == "corrected output"
