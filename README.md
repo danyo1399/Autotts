@@ -1,8 +1,7 @@
 # autobot-stt
 
 Speech-to-text (STT) API for Autobot voice input. Built with FastAPI and
-designed to stream microphone audio to text via REST and WebSocket endpoints
-(coming in later subtasks).
+designed to stream microphone audio to text via REST and WebSocket endpoints.
 
 ## Prerequisites
 

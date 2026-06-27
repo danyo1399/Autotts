@@ -25,7 +25,7 @@ def _extract_ws_token(websocket: WebSocket, token: str | None) -> str | None:
         return token
     auth = websocket.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
+        return auth[len("bearer "):].strip()
     return None
 
 

@@ -14,6 +14,10 @@ from autobot_stt.routes.stream import STREAM_FLUSH_SAMPLES, STREAM_MIN_BYTES_FOR
 from autobot_stt.services.audio_decoder import AudioDecodeError
 from autobot_stt.stores.memory import InMemorySessionStore
 
+# WebM EBML magic header; pairs with a payload big enough to clear the
+# STREAM_MIN_BYTES_FOR_DECODE threshold in one frame.
+_WEBM_EBML_HEADER = b"\x1a\x45\xdf\xa3"
+
 
 @pytest.fixture
 def mock_whisper() -> MagicMock:
@@ -40,6 +44,14 @@ def stream_client(
     app.dependency_overrides.clear()
 
 
+@pytest.fixture
+def api_key_env(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Configure STT_API_KEY and clear the settings cache; return the key."""
+    monkeypatch.setenv("STT_API_KEY", "test-secret")
+    get_settings.cache_clear()
+    return "test-secret"
+
+
 def _create_session(client: TestClient, token: str | None = None) -> str:
     headers = {"Authorization": f"Bearer {token}"} if token else None
     response = client.post("/v1/sessions", json={}, headers=headers)
@@ -48,7 +60,15 @@ def _create_session(client: TestClient, token: str | None = None) -> str:
 
 
 def _audio_chunk() -> bytes:
-    return b"\x1a\x45\xdf\xa3" + b"\x00" * STREAM_MIN_BYTES_FOR_DECODE
+    return _WEBM_EBML_HEADER + b"\x00" * STREAM_MIN_BYTES_FOR_DECODE
+
+
+async def _get_session(
+    store: InMemorySessionStore, session_id: str
+) -> object:
+    session = await store.get(session_id)
+    assert session is not None
+    return session
 
 
 def test_stream_connect_receives_ready(
@@ -66,7 +86,8 @@ def test_stream_connect_receives_ready(
     mock_whisper.transcribe.assert_not_called()
 
 
-def test_stream_binary_triggers_partial_transcript(
+@pytest.mark.asyncio
+async def test_stream_binary_triggers_partial_transcript(
     stream_client: TestClient,
     session_store: InMemorySessionStore,
     mock_whisper: MagicMock,
@@ -89,12 +110,13 @@ def test_stream_binary_triggers_partial_transcript(
     assert partial["is_final"] is False
 
     mock_whisper.transcribe.assert_called_once()
-    stored = session_store._sessions[session_id]
+    stored = await _get_session(session_store, session_id)
     assert stored.raw_transcript == "hello world"
     assert stored.partial_transcripts == ["hello world"]
 
 
-def test_stream_partial_transcript_is_cumulative(
+@pytest.mark.asyncio
+async def test_stream_partial_transcript_is_cumulative(
     stream_client: TestClient,
     session_store: InMemorySessionStore,
     mock_whisper: MagicMock,
@@ -117,19 +139,16 @@ def test_stream_partial_transcript_is_cumulative(
     assert first["text"] == "first chunk"
     assert second["text"] == "first chunk second chunk"
 
-    stored = session_store._sessions[session_id]
+    stored = await _get_session(session_store, session_id)
     assert stored.raw_transcript == "first chunk second chunk"
     assert stored.partial_transcripts == ["first chunk", "second chunk"]
 
 
 def test_stream_auth_failure_closes_4401(
     stream_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    api_key_env: str,
 ) -> None:
-    monkeypatch.setenv("STT_API_KEY", "test-secret")
-    get_settings.cache_clear()
-
-    session_id = _create_session(stream_client, token="test-secret")
+    session_id = _create_session(stream_client, token=api_key_env)
 
     with pytest.raises(WebSocketDisconnect) as exc:
         with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream"):
@@ -139,15 +158,12 @@ def test_stream_auth_failure_closes_4401(
 
 def test_stream_auth_via_query_token(
     stream_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    api_key_env: str,
 ) -> None:
-    monkeypatch.setenv("STT_API_KEY", "test-secret")
-    get_settings.cache_clear()
-
-    session_id = _create_session(stream_client, token="test-secret")
+    session_id = _create_session(stream_client, token=api_key_env)
 
     with stream_client.websocket_connect(
-        f"/v1/sessions/{session_id}/stream?token=test-secret"
+        f"/v1/sessions/{session_id}/stream?token={api_key_env}"
     ) as ws:
         ready = ws.receive_json()
     assert ready == {"type": "ready", "session_id": session_id}
@@ -155,16 +171,13 @@ def test_stream_auth_via_query_token(
 
 def test_stream_auth_via_bearer_header(
     stream_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    api_key_env: str,
 ) -> None:
-    monkeypatch.setenv("STT_API_KEY", "test-secret")
-    get_settings.cache_clear()
-
-    session_id = _create_session(stream_client, token="test-secret")
+    session_id = _create_session(stream_client, token=api_key_env)
 
     with stream_client.websocket_connect(
         f"/v1/sessions/{session_id}/stream",
-        headers={"Authorization": "Bearer test-secret"},
+        headers={"Authorization": f"Bearer {api_key_env}"},
     ) as ws:
         ready = ws.receive_json()
     assert ready == {"type": "ready", "session_id": session_id}

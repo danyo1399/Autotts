@@ -226,6 +226,44 @@ async with app.state.whisper_lock:
 calls, so an `asyncio.Lock` (`app.state.whisper_lock`, created in lifespan)
 serializes access across connections.
 
+## WebSocket streaming flush logic
+
+The stream handler (`routes/stream.py`) buffers incoming binary WebM
+frames and decides when to decode + transcribe using two thresholds and
+a silence timeout.
+
+**Why:** Sending every 50 ms Opus frame to ffmpeg+Whisper would pin the
+CPU without improving accuracy. Whisper performs best on a few seconds of
+audio at once. The thresholds batch small frames into ~2 s windows while
+still flushing promptly when the speaker pauses.
+
+**How:**
+
+- `STREAM_MIN_BYTES_FOR_DECODE = 1024` — byte threshold below which
+  `flush(force=False)` is a no-op. Guards against tiny initial frames.
+- `STREAM_FLUSH_SAMPLES = STREAM_CHUNK_SECONDS * PCM_SAMPLE_RATE` —
+  sample threshold that triggers transcription after decode. Default
+  `2 * 16000 = 32000` samples ≈ 2 s of audio.
+- `STREAM_SILENCE_TIMEOUT_SECONDS = 1.5` — `asyncio.wait_for` wraps
+  `websocket.receive()`; on `TimeoutError` the handler calls
+  `flush(force=True)` to drain whatever has accumulated.
+
+`flush(force=...)` decodes the buffered WebM bytes to PCM, then either
+calls `_transcribe_and_emit` (when the threshold is met or `force=True`)
+or returns early to wait for more audio. The WebM buffer is cleared as
+soon as a successful decode is consumed by the transcribe step.
+
+`_build_initial_prompt(session)` is computed **once per connection** from
+`session.draft_text` + `session.chat_history` via
+`services.whisper_service.build_initial_prompt`, then reused for every
+transcribe call on that connection.
+
+The cumulative `session.raw_transcript` is updated inside
+`_transcribe_and_emit`: new text is appended with a separating space, the
+same text is pushed onto `session.partial_transcripts`, and the entire
+`raw_transcript` is sent in each `partial_transcript` event (`is_final`
+is always `false` in this subtask — finalization is subtask 7).
+
 ## Pydantic schemas vs. domain models
 
 HTTP request/response payloads use thin Pydantic `BaseModel` classes

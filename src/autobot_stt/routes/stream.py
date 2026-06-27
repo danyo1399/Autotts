@@ -10,7 +10,11 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
 from autobot_stt.config import Settings, get_settings
 from autobot_stt.dependencies.auth import check_ws_api_key
-from autobot_stt.dependencies.store import get_session_store
+from autobot_stt.dependencies.store import (
+    get_session_store,
+    get_whisper_lock,
+    get_whisper_service,
+)
 from autobot_stt.models.session import Session
 from autobot_stt.services.audio_decoder import AudioDecodeError, decode_webm_opus_to_pcm
 from autobot_stt.services.whisper_service import WhisperService, build_initial_prompt
@@ -20,10 +24,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["stream"])
 
-STREAM_CHUNK_SECONDS = 2.0
+STREAM_CHUNK_SECONDS = 2
 STREAM_SILENCE_TIMEOUT_SECONDS = 1.5
 PCM_SAMPLE_RATE = 16000
-STREAM_FLUSH_SAMPLES = int(STREAM_CHUNK_SECONDS * PCM_SAMPLE_RATE)
+STREAM_FLUSH_SAMPLES = STREAM_CHUNK_SECONDS * PCM_SAMPLE_RATE
 STREAM_MIN_BYTES_FOR_DECODE = 1024
 
 WS_CLOSE_AUTH_FAILURE = 4401
@@ -37,6 +41,8 @@ async def stream_session(
     token: str | None = None,
     store: SessionStore = Depends(get_session_store),
     settings: Settings = Depends(get_settings),
+    whisper: WhisperService = Depends(get_whisper_service),
+    whisper_lock: asyncio.Lock = Depends(get_whisper_lock),
 ) -> None:
     """Stream binary WebM/Opus chunks; emit partial transcripts and accumulate text."""
     if not check_ws_api_key(websocket, token, settings):
@@ -51,10 +57,7 @@ async def stream_session(
     await websocket.accept()
     await websocket.send_json({"type": "ready", "session_id": session_id})
 
-    whisper = _get_whisper_service(websocket)
-    whisper_lock = _get_whisper_lock(websocket)
     initial_prompt = _build_initial_prompt(session)
-
     webm_buffer: bytearray = bytearray()
 
     async def flush(force: bool) -> None:
@@ -82,8 +85,7 @@ async def stream_session(
             )
             return
 
-        should_transcribe = force or len(pcm) >= STREAM_FLUSH_SAMPLES
-        if not should_transcribe:
+        if not force and len(pcm) < STREAM_FLUSH_SAMPLES:
             return
 
         webm_buffer.clear()
@@ -137,8 +139,8 @@ async def _transcribe_and_emit(
     async with whisper_lock:
         try:
             text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
-        except Exception as exc:  # noqa: BLE001 - log and recover, do not crash stream
-            logger.exception("whisper transcribe failed: %s", exc)
+        except Exception:  # noqa: BLE001 - log and recover, do not crash stream
+            logger.exception("whisper transcribe failed")
             await websocket.send_json(
                 {"type": "error", "message": "Transcription failed"}
             )
@@ -161,22 +163,8 @@ async def _transcribe_and_emit(
     )
 
 
-def _get_whisper_service(websocket: WebSocket) -> WhisperService:
-    service: WhisperService | None = getattr(websocket.app.state, "whisper_service", None)
-    if service is None:
-        raise RuntimeError("Whisper service is not initialized on app.state")
-    return service
-
-
-def _get_whisper_lock(websocket: WebSocket) -> asyncio.Lock:
-    lock: asyncio.Lock | None = getattr(websocket.app.state, "whisper_lock", None)
-    if lock is None:
-        raise RuntimeError("Whisper lock is not initialized on app.state")
-    return lock
-
-
 def _build_initial_prompt(session: Session) -> str | None:
     history: list[dict[str, str]] = [
         {"role": m.role, "content": m.content} for m in session.chat_history
     ]
-    return build_initial_prompt(session.draft_text, history) or None
+    return build_initial_prompt(session.draft_text, history)
