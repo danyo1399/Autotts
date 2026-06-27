@@ -161,7 +161,7 @@ async def verify_api_key(
         return  # dev mode — auth skipped
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Unauthorized")
-    if credentials.credentials != settings.stt_api_key:
+    if not _keys_match(credentials.credentials, settings.stt_api_key):
         raise HTTPException(status_code=401, detail="Unauthorized")
 ```
 
@@ -171,6 +171,9 @@ Notes:
   consistent body when the header is missing.
 - The error detail is always `"Unauthorized"` — we do not leak whether the
   header was missing, the scheme was wrong, or the key differed.
+- Both REST and WebSocket auth use the `_keys_match` helper for constant-time
+  comparison (see the [WebSocket auth](#websocket-auth-separate-from-rest-bearer)
+  section below for the implementation).
 - When `STT_API_KEY` is empty/unset, auth is bypassed entirely. This is
   local-dev convenience only; production must set a non-empty key.
 - Auth tests mutate `STT_API_KEY` via `monkeypatch.setenv` and clear the
@@ -202,8 +205,43 @@ and close with a WS-specific code.
 - Unknown sessions close with code `4404`.
 - When `STT_API_KEY` is empty, `check_ws_api_key` returns `True` and the
   handler proceeds (dev mode parity with REST).
-- Both the REST and WS paths compare keys with `hmac.compare_digest` to
-  avoid a timing side-channel on API-key guessing.
+- Both the REST and WS paths compare keys with `hmac.compare_digest` (via
+  the `_keys_match` helper) to avoid a timing side-channel on API-key guessing.
+
+### `_keys_match` — constant-time comparison
+
+The `_keys_match` helper wraps `hmac.compare_digest` with a `None` guard,
+since `compare_digest` requires both arguments to be the same type:
+
+```python
+def _keys_match(provided: str | None, expected: str) -> bool:
+    if provided is None:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+```
+
+The `None` check is essential: a missing credential must short-circuit rather
+than passing `None` to `.encode()`. Both sides are UTF-8 encoded so Unicode
+keys compare correctly.
+
+### `_extract_ws_token` — credential source precedence
+
+WebSocket clients authenticate via `?token=` query param **or**
+`Authorization: Bearer` header. Query param wins when both are present:
+
+```python
+def _extract_ws_token(websocket: WebSocket, token: str | None) -> str | None:
+    if token:
+        return token
+    auth = websocket.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[len("bearer "):].strip()
+    return None
+```
+
+The `"bearer "` prefix length is expressed as `len("bearer ")` rather than
+a magic number `7`, so the intent is self-documenting and survives scheme
+changes. The scheme comparison is case-insensitive (`startswith` on `.lower()`).
 
 ### Query-string token exposure (deployment caveat)
 
@@ -247,6 +285,82 @@ should not expect `app.state.whisper_lock` to serialize work across
 workers. Each worker also holds its own `session_store`; subtask 7 will
 need to externalize state before horizontal scaling is meaningful.
 
+### Whisper service/lock DI accessors
+
+The stream handler receives `WhisperService` and `asyncio.Lock` via
+`Depends()` helpers in `dependencies/store.py`, not by reaching into
+`request.app.state` inside the handler:
+
+```python
+def get_whisper_service(conn: HTTPConnection) -> WhisperService:
+    service = getattr(conn.app.state, "whisper_service", None)
+    if service is None:
+        raise RuntimeError("Whisper service is not initialized on app.state")
+    return service
+
+def get_whisper_lock(conn: HTTPConnection) -> asyncio.Lock:
+    lock = getattr(conn.app.state, "whisper_lock", None)
+    if lock is None:
+        raise RuntimeError("Whisper lock is not initialized on app.state")
+    return lock
+```
+
+**Why:** Keeps the stream handler focused on protocol logic. The `RuntimeError`
+surfaces missing-lifespan-wiring early with a clear message, rather than an
+opaque `AttributeError` at the first transcribe call. See also
+[`HTTPConnection` for WS-safe DI](#httpconnection-for-websocket-safe-dependency-injection)
+below.
+
+### Transcript mutation within `whisper_lock`
+
+The `_transcribe_and_emit` function holds `whisper_lock` across **both** the
+`whisper.transcribe()` call **and** the `session.raw_transcript`
+read-modify-write, not just the model call:
+
+```python
+async with whisper_lock:
+    text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
+    if not text:
+        return
+    if session.raw_transcript:
+        session.raw_transcript += " "
+    session.raw_transcript += text
+    session.partial_transcripts.append(text)
+    cumulative = session.raw_transcript
+```
+
+**Why:** If the transcribe call were inside the lock but the transcript
+update were after releasing it, two concurrent WebSocket connections to the
+same session could interleave their appends. One connection's output would be
+overwritten. Locking the entire critical section makes the mutation
+unambiguously safe — no `await` in the mutation today keeps it atomic under
+the GIL, but the lock guarantees safety even if a future `await` is inserted
+between the read and write.
+
+## `HTTPConnection` for WebSocket-safe dependency injection
+
+Dependency accessors used by both HTTP and WebSocket routes must type
+their parameter as `HTTPConnection` (from Starlette), not `Request`.
+
+**Why:** WebSocket connections are not `Request` objects. A dependency
+declared with `def get_x(request: Request) -> X` raises
+`AttributeError` when FastAPI tries to inject it into a WebSocket route
+handler. `HTTPConnection` is the common parent of both `Request` and
+`WebSocket`, so it resolves correctly for both.
+
+**How:**
+
+```python
+from starlette.requests import HTTPConnection
+
+def get_session_store(conn: HTTPConnection) -> SessionStore:
+    return conn.app.state.session_store
+```
+
+The `dependencies/store.py` module uses this pattern for all three
+injectors (`get_session_store`, `get_whisper_service`,
+`get_whisper_lock`).
+
 ## WebSocket streaming flush logic
 
 The stream handler (`routes/stream.py`) buffers incoming binary WebM
@@ -273,6 +387,15 @@ still flushing promptly when the speaker pauses.
 calls `_transcribe_and_emit` (when the threshold is met or `force=True`)
 or returns early to wait for more audio. The WebM buffer is cleared as
 soon as a successful decode is consumed by the transcribe step.
+
+**Partial decode deferral.** An `AudioDecodeError` during a non-forced
+flush does not close the connection — the handler logs at `DEBUG` level
+and returns, waiting for more bytes. This is necessary because
+`MediaRecorder` fragments may not be valid WebM independently; they only
+form a valid stream once enough chunks have accumulated. On a forced
+flush (silence timeout or disconnect), the same error is reported to the
+client as `{"type": "error", "message": "Failed to decode audio"}`.
+`FileNotFoundError` (ffmpeg missing) is always reported immediately.
 
 `_build_initial_prompt(session)` is computed **once per connection** from
 `session.draft_text` + `session.chat_history` via
