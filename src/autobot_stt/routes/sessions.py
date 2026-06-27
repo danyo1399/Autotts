@@ -53,13 +53,13 @@ async def finalize_session(
     store: SessionStore = Depends(get_session_store),
     settings: Settings = Depends(get_settings),
 ) -> FinalizeSessionResponse:
-    if not settings.openai_api_key:
-        raise HTTPException(status_code=503, detail="OpenAI API key not configured")
     session = await store.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     if not session.raw_transcript.strip():
         raise HTTPException(status_code=400, detail="Session has no transcript")
+    if not settings.openai_api_key.strip():
+        raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
     raw_transcript = session.raw_transcript
     cleaned = await cleanup_transcript(session, api_key=settings.openai_api_key)

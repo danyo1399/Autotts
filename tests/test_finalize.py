@@ -133,6 +133,28 @@ async def test_finalize_missing_openai_key_returns_503(
 
 
 @pytest.mark.asyncio
+async def test_finalize_whitespace_openai_key_returns_503(
+    client, session_store, auth_headers, monkeypatch
+) -> None:
+    _set_openai_key(monkeypatch, value="   ")
+    session_id = await _create_session_with_transcript(
+        client, session_store, "hello", auth_headers=auth_headers
+    )
+
+    with patch(
+        "autobot_stt.routes.sessions.cleanup_transcript",
+        new_callable=AsyncMock,
+    ) as mock_cleanup:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/finalize", headers=auth_headers
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "OpenAI API key not configured"
+    mock_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_finalize_deletes_session(
     client, session_store, auth_headers, monkeypatch
 ) -> None:
@@ -210,6 +232,8 @@ async def test_cleanup_transcript_calls_openai_with_expected_payload(monkeypatch
     create_mock = AsyncMock(return_value=fake_response)
     client_mock = MagicMock()
     client_mock.chat.completions.create = create_mock
+    client_mock.__aenter__ = AsyncMock(return_value=client_mock)
+    client_mock.__aexit__ = AsyncMock(return_value=None)
 
     with patch.object(llm_cleanup, "AsyncOpenAI", return_value=client_mock):
         result = await llm_cleanup.cleanup_transcript(session, api_key="sk-test")

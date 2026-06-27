@@ -58,13 +58,15 @@ async def cleanup_transcript(session: Session, *, api_key: str) -> str:
     Raises:
         openai.OpenAIError: Propagated from the OpenAI API call.
     """
-    client = AsyncOpenAI(api_key=api_key)
-    response = await client.chat.completions.create(
-        model=_MODEL,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_message(session)},
-        ],
-    )
+    async with AsyncOpenAI(api_key=api_key) as client:
+        response = await client.chat.completions.create(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": _build_user_message(session)},
+            ],
+        )
+    if not response.choices:
+        return ""
     content = response.choices[0].message.content or ""
     return content.strip()
