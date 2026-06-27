@@ -23,7 +23,7 @@ cp .env.example .env   # optional — defaults apply
 
 ## Run
 
-Start the API in development mode:
+Start the API:
 
 ```bash
 uv run uvicorn autobot_stt.main:app --reload
@@ -36,6 +36,9 @@ uv run autobot-stt
 ```
 
 The server listens on `http://localhost:8000`.
+
+**Note:** `uv run autobot-stt` runs without `--reload` (production-safe); use
+`uv run uvicorn autobot_stt.main:app --reload` for hot-reload in development.
 
 ## API
 
@@ -146,6 +149,7 @@ require no ffmpeg, GPU, or network access.
 | `test_dependencies_auth.py` | `_extract_ws_token` precedence/normalization, `check_ws_api_key` bypass/match/reject |
 | `test_dependencies_store.py` | `get_session_store` happy path, `get_whisper_service`/`get_whisper_lock` happy + `RuntimeError` on missing state |
 | `test_whisper_service.py` | `build_initial_prompt` logic, mocked `WhisperModel.load`/`transcribe`, beam size/VAD kwargs, empty/multi-dim input handling |
+| `test_stores_memory.py` | `InMemorySessionStore` unit tests: create+get, get-missing, delete-found, delete-missing |
 | `test_preload_whisper_model.py` | GPU build-time preload: `_expected_cache_dir()` paths, `main()` CPU/int8 hardcoding, cache-miss exit code |
 | `test_docker_config.py` | `docker-compose.yml` shape, `Dockerfile` / `Dockerfile.gpu` defaults and preload ordering, `.dockerignore` patterns, real `docker compose config` validation |
 | `test_stream.py` | WebSocket streaming: `ready` handshake, partial transcripts (incremental + cumulative), auth (4401, query-token, Bearer-header, key-empty bypass), 4404 unknown session, decode/ffmpeg/whisper error events, threshold-gated flushes, text-frame ignore, silence-timeout no-op |
@@ -349,6 +353,10 @@ Takes the session's raw Whisper transcript plus stored context (`draft_text`,
 errors, returns the cleaned text for appending to the user's draft, then
 deletes the session.
 
+**Transcript snapshot.** The session is copied (`model_copy`) before the OpenAI
+call so concurrent WebSocket stream mutations do not alter the transcript sent
+to cleanup.
+
 ```bash
 curl -X POST http://localhost:8000/v1/sessions/<session_id>/finalize \
   -H "Authorization: Bearer $STT_API_KEY"
@@ -428,12 +436,18 @@ parallel calls), appends the new text to `session.raw_transcript`, and
 emits a `partial_transcript` event. Decode and transcribe run in
 `asyncio.to_thread` so the event loop is not blocked.
 
-The transcript read-modify-write happens **inside** the same lock, so two
-concurrent connections to the same session cannot interleave appends and
-lose text.
+The transcript read-modify-write happens **inside** the same lock, while the
+JSON emit happens **outside** it. This prevents a slow WebSocket client from
+stalling other transcription sessions waiting on the lock.
+
+**Session-deletion detection.** Before transcribing and before mutating the
+transcript, the handler checks whether the session still exists in the store
+(a concurrent `finalize` or `DELETE` may have removed it). If the session is
+gone, the stream loop stops immediately — no transcript appends are lost and
+no stale data is emitted.
 
 On client disconnect the session and accumulated transcript are preserved;
-finalization happens via the REST API in subtask 7.
+finalization happens via the REST API.
 
 ### Deployment caveats
 
@@ -461,6 +475,11 @@ Key details:
 - `LOG_LEVEL` is constrained to `"debug" | "info" | "warning" | "error" | "critical"`
   via a `LogLevel` `Literal` type. Invalid values raise `ValidationError` at
   construction time.
+- `WHISPER_DEVICE` is constrained to `"cpu" | "cuda"` via a `WhisperDevice`
+  `Literal` type. Invalid values raise `ValidationError` at construction time.
+- When `STT_API_KEY` is unset/empty, the server logs a `WARNING` on startup
+  and disables Bearer auth on `/v1/*`. This is local-dev convenience only;
+  production must set a non-empty key.
 
 ## Version management
 

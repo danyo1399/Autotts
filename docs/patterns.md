@@ -70,10 +70,16 @@ pydantic construction time, catching errors early.
 from typing import Literal
 
 LogLevel = Literal["debug", "info", "warning", "error", "critical"]
+WhisperDevice = Literal["cpu", "cuda"]
 
 class Settings(BaseSettings):
     log_level: LogLevel = "info"
+    whisper_device: WhisperDevice = "cpu"
 ```
+
+`WhisperDevice` follows the same pattern as `LogLevel`: a typed alias that
+catches invalid values (e.g. `"cuda:0"`, `"gpu"`) at construction time rather
+than at model-load time.
 
 ## Env variable testing with monkeypatch
 
@@ -95,19 +101,22 @@ def test_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 ## Entry point: `run()`
 
 The `main.py` module exposes a `run()` function that invokes `uvicorn.run()`
-with `reload=True` for development convenience.
+for development convenience.
 
 **Why:** Allows `uv run autobot-stt` as a shorthand for the full uvicorn
 command. The entry point is registered in `pyproject.toml` under
-`[project.scripts]`.
+`[project.scripts]`. `reload=True` is intentionally omitted from `run()` —
+production safety takes precedence; use `uv run uvicorn ... --reload` explicitly
+when hot-reload is needed during development.
 
 ```python
 def run() -> None:
+    settings = get_settings()
+    logging.basicConfig(level=settings.log_level.upper())
     uvicorn.run(
         "autobot_stt.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
     )
 ```
 
@@ -173,6 +182,32 @@ except OpenAIError as exc:
 # Only delete session on success
 await store.delete(session_id)
 ```
+
+## Transcript snapshot on finalize (defensive copy)
+
+The finalize endpoint copies the session before passing it to the OpenAI
+cleanup call:
+
+```python
+cleanup_session = session.model_copy(update={"raw_transcript": raw_transcript})
+try:
+    cleaned = await cleanup_transcript(cleanup_session, api_key=...)
+```
+
+**Why:** While the OpenAI call is in flight, a concurrent WebSocket streaming
+connection could mutate `session.raw_transcript`. Without the copy, the
+transcript sent to cleanup would differ from the one returned to the client in
+the response. The copy ensures both `raw_transcript` in the response and the
+value seen by `cleanup_transcript` reflect the same point-in-time snapshot.
+
+**How:** `session.model_copy(update={"raw_transcript": raw_transcript})` creates
+a shallow copy of the `Session` pydantic model with the transcript field pinned
+to the string that was read before the copy. The `raw_transcript` binding on
+line 87 already holds an immutable `str`; the `model_copy` guards against other
+attribute changes on the session (none today, but future-proof).
+
+The session is deleted only on success (line 99), so the caller can retry on
+OpenAI failures without losing the accumulated transcript.
 
 ## Guarding against empty API responses
 
@@ -371,7 +406,7 @@ opaque `AttributeError` at the first transcribe call. See also
 [`HTTPConnection` for WS-safe DI](#httpconnection-for-websocket-safe-dependency-injection)
 below.
 
-### Transcript mutation within `whisper_lock`
+### Transcript mutation within `whisper_lock` — emit outside lock
 
 The `_transcribe_and_emit` function holds `whisper_lock` across **both** the
 `whisper.transcribe()` call **and** the `session.raw_transcript`
@@ -379,23 +414,51 @@ read-modify-write, not just the model call:
 
 ```python
 async with whisper_lock:
-    text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
-    if not text:
-        return
-    if session.raw_transcript:
-        session.raw_transcript += " "
-    session.raw_transcript += text
-    session.partial_transcripts.append(text)
-    cumulative = session.raw_transcript
+    if await store.get(session.id) is None:
+        return False
+    try:
+        text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
+    except Exception:
+        transcribe_error = True
+    else:
+        if text:
+            if await store.get(session.id) is None:
+                return False
+            if session.raw_transcript:
+                session.raw_transcript += " "
+            session.raw_transcript += text
+            session.partial_transcripts.append(text)
+            cumulative = session.raw_transcript
+
+# Send outside the lock so a slow client cannot stall other transcriptions.
+if transcribe_error:
+    await websocket.send_json({"type": "error", "message": "Transcription failed"})
+elif cumulative is not None:
+    await websocket.send_json({"type": "partial_transcript", "text": cumulative, ...})
 ```
 
-**Why:** If the transcribe call were inside the lock but the transcript
-update were after releasing it, two concurrent WebSocket connections to the
-same session could interleave their appends. One connection's output would be
-overwritten. Locking the entire critical section makes the mutation
-unambiguously safe — no `await` in the mutation today keeps it atomic under
-the GIL, but the lock guarantees safety even if a future `await` is inserted
+**Why (lock scope):** If the transcribe call were inside the lock but the
+transcript update were after releasing it, two concurrent WebSocket connections
+to the same session could interleave their appends. One connection's output
+would be overwritten. Locking the entire critical section makes the mutation
+unambiguously safe — no `await` in the mutation today keeps it atomic under the
+GIL, but the lock guarantees safety even if a future `await` is inserted
 between the read and write.
+
+**Why (emit outside):** If `websocket.send_json` were inside the lock, a slow
+client that reads the socket slowly would hold the lock open, stalling other
+sessions waiting to transcribe. Emitting outside the lock means lock duration is
+bounded by model inference + dict append (~10-100 ms), not by network I/O.
+
+**Session-deletion detection.** Before transcribing and again before mutating,
+the handler checks `store.get(session.id)` — if a concurrent `finalize` or
+`DELETE` removed the session, the handler returns `False` and the stream loop
+stops. Without this, streaming could continue on a deleted session, appending
+transcript text to an orphan object that will never be finalized.
+
+**Error recovery.** Transcribe failures (`Exception`) are caught, logged, and
+reported as an error event — the connection stays open and subsequent chunks
+can still be processed. Only the session-gone case stops the stream.
 
 ## `HTTPConnection` for WebSocket-safe dependency injection
 
