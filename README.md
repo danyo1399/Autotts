@@ -97,6 +97,84 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 uv run ruff check .
 ```
 
+## Docker
+
+Two images are provided: a CPU image for local development and a GPU image
+for production with the Whisper `small` model baked in.
+
+### Prerequisites
+
+- Docker Engine with Docker Compose v2
+- For the GPU image: an NVIDIA driver and the
+  [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+
+### Environment variables
+
+Both images read runtime configuration from a `.env` file (Compose) or
+`--env-file` flag (`docker run`). Create one from the example:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Required | Notes |
+|----------|----------|-------|
+| `STT_API_KEY` | Production: yes | Bearer token for `/v1/*`; empty skips auth (local dev only) |
+| `OPENAI_API_KEY` | When using OpenAI cleanup (subtask 7) | Post-processing |
+| `WHISPER_MODEL` | No | Set by image defaults (`base` CPU, `small` GPU); override via env |
+| `WHISPER_DEVICE` | No | Set by image defaults (`cpu` / `cuda`) |
+| `LOG_LEVEL` | No | Default `info` |
+
+### Local development (CPU)
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+Health check (in another terminal):
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok"}
+```
+
+The first start downloads the Whisper `base` model (~150 MB) into the
+container's Hugging Face cache; subsequent starts reuse it.
+
+### Production GPU image
+
+Build the image (no GPU required during `docker build`):
+
+```bash
+docker build -f Dockerfile.gpu -t autobot-stt:gpu .
+```
+
+Run with GPU access:
+
+```bash
+docker run --gpus all -p 8000:8000 --env-file .env autobot-stt:gpu
+```
+
+The `small` model (~500 MB) is baked into the image during build, so runtime
+startup does not hit the network. Verify the cache after build:
+
+```bash
+docker run --rm autobot-stt:gpu \
+  find /root/.cache/huggingface -name '*faster-whisper-small*' | head
+```
+
+### GPU via Compose profile
+
+```bash
+docker compose --profile gpu up --build stt-gpu
+```
+
+### Notes
+
+- The CPU and GPU services both bind `8000:8000`; only run one at a time.
+- CI does not currently build Docker images.
+
 ## CI
 
 GitHub Actions runs lint and tests on every push and pull request to

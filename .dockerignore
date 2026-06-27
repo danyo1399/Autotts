@@ -1,0 +1,35 @@
+# Version control
+.git
+.gitignore
+
+# Python caches and build artifacts
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Virtual environments (uv creates one inside the image)
+.venv
+venv
+env
+
+# Local environment files (must be supplied at runtime via compose/env-file)
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
+.vscode
+.idea
+
+# CI / docs / task runtime artifacts not needed inside the image
+.github
+tests
+docs
+.autobot_*
+
+# Markdown except README
+*.md
+!README.md

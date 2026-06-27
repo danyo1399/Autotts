@@ -1,0 +1,49 @@
+services:
+  # Default CPU service for local development. Started by `docker compose up`.
+  stt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Lifespan loads Whisper before serving. First CPU run may download the
+      # base model (~150 MB); give it room to avoid false unhealthy flapping.
+      start_period: 120s
+
+  # Production GPU service. Started with `docker compose --profile gpu up stt-gpu`.
+  # Requires the NVIDIA Container Toolkit and a GPU on the host.
+  stt-gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      WHISPER_MODEL: small
+      WHISPER_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Model is baked into the image; only the cuDNN init + CUDA context load.
+      start_period: 60s

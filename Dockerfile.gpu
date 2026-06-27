@@ -1,0 +1,58 @@
+# Production GPU image for autobot-stt.
+#
+# Uses the CUDA 12.4.1 + cuDNN 9 runtime base, which is required by
+# ctranslate2 4.8.0 (the runtime backend for faster-whisper). The plain
+# ``nvidia/cuda:12.4.1-runtime-ubuntu22.04`` image lacks cuDNN and crashes on
+# ``WhisperService.load()`` with ``Unable to load libcudnn_ops.so.9``. For
+# CUDA 12.4+ the ``cudnn-runtime`` tag already ships cuDNN 9.x; the older
+# ``cudnn9-runtime`` spelling is only present on CUDA <= 12.3.
+#
+# The Whisper ``small`` model is **baked** into the image at build time via
+# ``scripts/preload_whisper_model.py``. The download is performed with
+# ``device="cpu"`` so no GPU is required during ``docker build``; weights are
+# device-agnostic and reused at runtime with ``WHISPER_DEVICE=cuda`` /
+# ``compute_type=float16``.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+# Pin uv for reproducible builds; copy the binary from the official image.
+COPY --from=ghcr.io/astral-sh/uv:0.11.25 /uv /uvx /bin/
+
+ENV UV_NO_DEV=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    PATH=/app/.venv/bin:$PATH \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+    UV_PYTHON_PREFERENCE=only-managed \
+    HF_HOME=/root/.cache/huggingface
+
+# Install python 3.12 via uv (CUDA base image does not ship it), plus the same
+# system packages as the CPU image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && uv python install 3.12
+
+ENV UV_PYTHON=3.12
+
+WORKDIR /app
+
+# Layer 1: dependencies only.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project
+
+# Layer 2: application source.
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen
+
+# Bake the small model into the Hugging Face cache layer of the image.
+ENV WHISPER_MODEL=small \
+    WHISPER_DEVICE=cuda
+RUN uv run python scripts/preload_whisper_model.py
+
+EXPOSE 8000
+
+CMD ["uv", "run", "uvicorn", "autobot_stt.main:app", "--host", "0.0.0.0", "--port", "8000"]
