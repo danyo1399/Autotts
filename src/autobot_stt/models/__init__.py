@@ -4,6 +4,7 @@ from autobot_stt.models.session import (
     Comment,
     CreateSessionRequest,
     CreateSessionResponse,
+    FinalizeSessionResponse,
     Session,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "Comment",
     "CreateSessionRequest",
     "CreateSessionResponse",
+    "FinalizeSessionResponse",
     "Session",
 ]

@@ -21,6 +21,8 @@ def test_openapi_schema_includes_sessions_endpoints() -> None:
     assert "post" in paths["/v1/sessions"]
     assert "/v1/sessions/{session_id}" in paths
     assert "delete" in paths["/v1/sessions/{session_id}"]
+    assert "/v1/sessions/{session_id}/finalize" in paths
+    assert "post" in paths["/v1/sessions/{session_id}/finalize"]
 
 
 def test_run_invokes_uvicorn_with_expected_args() -> None:

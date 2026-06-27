@@ -26,6 +26,11 @@ class CreateSessionResponse(BaseModel):
     session_id: str
 
 
+class FinalizeSessionResponse(BaseModel):
+    text: str
+    raw_transcript: str
+
+
 class Session(BaseModel):
     id: str
     draft_text: str
