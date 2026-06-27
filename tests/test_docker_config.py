@@ -149,8 +149,14 @@ def test_gpu_dockerfile_defers_cuda_device_until_after_preload() -> None:
     reads the env var to break builds on hosts without a GPU.
     """
     content = _read(REPO_ROOT / "Dockerfile.gpu")
-    preload_idx = content.index("scripts/preload_whisper_model.py")
-    cuda_idx = content.index("WHISPER_DEVICE=cuda")
+    # Strip comment lines so the assertion anchors on actual directives, not on
+    # prose in the header comment (which also mentions both tokens above the
+    # ``RUN`` / ``ENV`` lines).
+    directives = "\n".join(
+        line for line in content.splitlines() if not line.lstrip().startswith("#")
+    )
+    preload_idx = directives.index("scripts/preload_whisper_model.py")
+    cuda_idx = directives.index("ENV WHISPER_DEVICE=cuda")
     assert cuda_idx > preload_idx
 
 
