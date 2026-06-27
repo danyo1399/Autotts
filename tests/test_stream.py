@@ -202,14 +202,68 @@ def test_stream_decode_error_sends_error_event(
         "autobot_stt.routes.stream.decode_webm_opus_to_pcm",
         side_effect=AudioDecodeError("bad bytes"),
     ):
-        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
-            ws.receive_json()
-            ws.send_bytes(_audio_chunk())
-            error_event = ws.receive_json()
+        with patch("autobot_stt.routes.stream.STREAM_SILENCE_TIMEOUT_SECONDS", 0.01):
+            with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+                ws.receive_json()
+                ws.send_bytes(_audio_chunk())
+                error_event = ws.receive_json()
 
     assert error_event["type"] == "error"
     assert error_event["message"] == "Failed to decode audio"
     mock_whisper.transcribe.assert_not_called()
+
+
+def test_stream_incomplete_webm_buffers_without_error(
+    stream_client: TestClient,
+    mock_whisper: MagicMock,
+    mock_pcm: np.ndarray,
+) -> None:
+    """Partial MediaRecorder fragments that fail decode should buffer, not error."""
+    session_id = _create_session(stream_client)
+    decode_calls = 0
+
+    def decode_side_effect(batch: bytes) -> np.ndarray:
+        nonlocal decode_calls
+        decode_calls += 1
+        if decode_calls == 1:
+            raise AudioDecodeError("incomplete webm fragment")
+        return mock_pcm
+
+    with patch(
+        "autobot_stt.routes.stream.decode_webm_opus_to_pcm",
+        side_effect=decode_side_effect,
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()
+            ws.send_bytes(_audio_chunk())
+            ws.send_bytes(_audio_chunk())
+            partial = ws.receive_json()
+
+    assert partial["type"] == "partial_transcript"
+    assert partial["text"] == "hello world"
+    mock_whisper.transcribe.assert_called_once()
+
+
+def test_stream_works_without_store_dependency_override(
+    mock_whisper: MagicMock,
+    mock_pcm: np.ndarray,
+) -> None:
+    """Regression: get_session_store must accept HTTPConnection, not only Request."""
+    with patch("autobot_stt.services.whisper_service.WhisperModel"):
+        with TestClient(app) as client:
+            app.state.whisper_service = mock_whisper
+            session_id = client.post("/v1/sessions", json={}).json()["session_id"]
+            with patch(
+                "autobot_stt.routes.stream.decode_webm_opus_to_pcm",
+                return_value=mock_pcm,
+            ):
+                with client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+                    ready = ws.receive_json()
+                    ws.send_bytes(_audio_chunk())
+                    partial = ws.receive_json()
+
+    assert ready["type"] == "ready"
+    assert partial["type"] == "partial_transcript"
 
 
 def test_stream_skips_auth_when_key_empty(

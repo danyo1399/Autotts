@@ -71,6 +71,10 @@ async def stream_session(
         try:
             pcm = await asyncio.to_thread(decode_webm_opus_to_pcm, batch)
         except AudioDecodeError as exc:
+            if not force:
+                # MediaRecorder fragments may not decode until more bytes arrive.
+                logger.debug("audio decode deferred (incomplete batch): %s", exc)
+                return
             logger.warning("audio decode failed: %s", exc)
             webm_buffer.clear()
             await websocket.send_json(
@@ -167,4 +171,5 @@ def _build_initial_prompt(session: Session) -> str | None:
     history: list[dict[str, str]] = [
         {"role": m.role, "content": m.content} for m in session.chat_history
     ]
-    return build_initial_prompt(session.draft_text, history)
+    prompt = build_initial_prompt(session.draft_text, history)
+    return prompt or None
