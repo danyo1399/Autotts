@@ -110,3 +110,85 @@ def run() -> None:
         reload=True,
     )
 ```
+
+## Session store: Protocol + dependency injection
+
+Session storage is defined by a `SessionStore` `Protocol` in
+`stores/base.py` and implemented by `InMemorySessionStore` in
+`stores/memory.py`. Routes receive the store through FastAPI's `Depends()`.
+
+**Why:** The `Protocol` enables structural subtyping — tests can provide
+fakes without inheriting. The dependency boundary means the store can be
+swapped (Redis, SQL, …) by changing only the lifespan setup in `main.py`,
+with no route changes.
+
+**How:**
+
+- `main.py` lifespan instantiates one `InMemorySessionStore` and stores it
+  on `app.state.session_store`.
+- `dependencies/store.py` exposes `get_session_store(request)` which reads
+  from `request.app.state.session_store`.
+- Routes declare `store: SessionStore = Depends(get_session_store)`.
+- Tests override the dependency via
+  `app.dependency_overrides[get_session_store] = lambda: fake_store`.
+
+`InMemorySessionStore` uses an `asyncio.Lock` to serialize dict mutation so
+concurrent `create`/`delete` calls cannot corrupt the dict.
+
+## Router-scoped Bearer auth
+
+Authentication is enforced on `/v1/*` via a `verify_api_key` FastAPI
+dependency attached to the v1 router, not via HTTP middleware.
+
+**Why:** `Depends()` is the idiomatic FastAPI pattern for request
+validation. Scoping it to the router (instead of the root app) automatically
+protects `/v1/*` while leaving `/health`, `/docs`, `/redoc`, and
+`/openapi.json` open.
+
+**How:**
+
+```python
+from fastapi import Depends, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+_bearer = HTTPBearer(auto_error=False)
+
+async def verify_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+    settings: Settings = Depends(get_settings),
+) -> None:
+    if not settings.stt_api_key:
+        return  # dev mode — auth skipped
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if credentials.credentials != settings.stt_api_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+```
+
+Notes:
+
+- `HTTPBearer(auto_error=False)` lets us return `401` (not `403`) with a
+  consistent body when the header is missing.
+- The error detail is always `"Unauthorized"` — we do not leak whether the
+  header was missing, the scheme was wrong, or the key differed.
+- When `STT_API_KEY` is empty/unset, auth is bypassed entirely. This is
+  local-dev convenience only; production must set a non-empty key.
+- Auth tests mutate `STT_API_KEY` via `monkeypatch.setenv` and clear the
+  `get_settings` cache (`get_settings.cache_clear()`) so the new value is
+  picked up. The `conftest._clear_settings_cache` autouse fixture clears
+  the cache before and after every test to prevent leakage.
+
+## Pydantic schemas vs. domain models
+
+HTTP request/response payloads use thin Pydantic `BaseModel` classes
+(`models/session.py`). The internal `Session` model is also a `BaseModel`
+but carries runtime-only fields (`raw_transcript`, `partial_transcripts`,
+`created_at`) that are never accepted from the client.
+
+**Why:** Keeping the REST contract thin prevents clients from setting
+server-managed fields. The domain model can grow later (audio transcripts,
+LLM-finalized text) without changing the public API.
+
+**How:** Route handlers translate `CreateSessionRequest` → `Session` by
+generating `id` (UUID4) and `created_at` (UTC now), then call
+`store.create(session)` and return `CreateSessionResponse(session_id=...)`.

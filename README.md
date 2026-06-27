@@ -45,16 +45,29 @@ src/autobot_stt/
 ├── __init__.py          # package version (single source of truth)
 ├── main.py              # FastAPI app factory, /health endpoint, uvicorn entry
 ├── config.py            # pydantic-settings config, cached singleton
-└── services/
-    ├── __init__.py
-    └── audio_decoder.py # WebM/Opus -> 16 kHz mono PCM (ffmpeg)
+├── services/
+│   ├── __init__.py
+│   └── audio_decoder.py # WebM/Opus -> 16 kHz mono PCM (ffmpeg)
+├── models/
+│   └── session.py       # ChatMessage, Comment, Session, request/response schemas
+├── stores/
+│   ├── base.py          # SessionStore Protocol
+│   └── memory.py        # InMemorySessionStore (asyncio.Lock-guarded dict)
+├── dependencies/
+│   ├── auth.py          # verify_api_key (Bearer auth on /v1/*)
+│   └── store.py         # get_session_store (app.state singleton)
+└── routes/
+    └── sessions.py      # POST /v1/sessions, DELETE /v1/sessions/{id}
 tests/
 ├── fixtures/
 │   └── sample.webm      # tiny WebM/Opus clip for decoder tests
+├── conftest.py          # shared fixtures: client, store override, auth_headers
 ├── test_health.py       # async health endpoint tests (httpx.AsyncClient)
 ├── test_config.py       # settings defaults, env loading, LogLevel validation
 ├── test_app.py          # OpenAPI schema, metadata, run() entry point tests
-└── test_audio_decoder.py # audio decoder success, sample rate, error paths
+├── test_audio_decoder.py # audio decoder success, sample rate, error paths
+├── test_sessions.py     # POST/DELETE session REST contract
+└── test_auth.py         # Bearer auth enforcement on /v1/*
 ```
 
 ## Test
@@ -72,6 +85,8 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_config.py` | Settings defaults, env overrides, `get_settings()` caching, `LogLevel` validation |
 | `test_app.py` | OpenAPI schema shape, `run()` delegates to uvicorn with correct args |
 | `test_audio_decoder.py` | WebM/Opus decode to mono float32 PCM, sample-rate handling, error paths; skips when ffmpeg is absent |
+| `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
+| `test_auth.py` | Bearer auth enforced on `/v1/*` when `STT_API_KEY` set; skipped when empty |
 
 ## Lint
 
@@ -115,6 +130,45 @@ With the server running:
 curl http://localhost:8000/health
 # {"status":"ok"}
 ```
+
+## Sessions API
+
+All session endpoints are mounted under `/v1` and require a Bearer token
+when `STT_API_KEY` is set. With an empty/unset `STT_API_KEY`, auth is
+skipped (local dev mode only).
+
+### Create a session
+
+```bash
+curl -X POST http://localhost:8000/v1/sessions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $STT_API_KEY" \
+  -d '{"draft_text":"hello","chat_history":[],"comments":[]}'
+# HTTP/1.1 201 Created
+# {"session_id":"<uuid4>"}
+```
+
+Request body fields (all optional, default to empty):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `draft_text` | `string` | Default `""` |
+| `chat_history` | `list[{role, content}]` | `role` is `"user"` or `"assistant"` |
+| `comments` | `list[{author, body}]` | |
+
+### Delete a session
+
+```bash
+curl -X DELETE http://localhost:8000/v1/sessions/<session_id> \
+  -H "Authorization: Bearer $STT_API_KEY"
+# HTTP/1.1 204 No Content  (404 if unknown)
+```
+
+### Authentication
+
+- Header: `Authorization: Bearer <STT_API_KEY>`
+- Applied to all `/v1/*` routes. `/health`, `/docs`, `/openapi.json` remain open.
+- Missing or wrong token returns `401 Unauthorized`.
 
 ## Configuration
 
