@@ -70,6 +70,17 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 uv run ruff check .
 ```
 
+## CI
+
+GitHub Actions runs lint and tests on every push and pull request to
+`setup-autobot-tts-at1` and `main`:
+
+1. `uv sync --frozen`
+2. `uv run ruff check .`
+3. `uv run pytest -v` (with `WHISPER_MODEL=base`, `WHISPER_DEVICE=cpu`)
+
+Workflow definition: [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
 ## Health check
 
 With the server running:
