@@ -23,7 +23,8 @@ ENV UV_NO_DEV=1 \
     PATH=/app/.venv/bin:$PATH \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     UV_PYTHON_PREFERENCE=only-managed \
-    HF_HOME=/root/.cache/huggingface
+    HF_HOME=/root/.cache/huggingface \
+    PYTHONUNBUFFERED=1
 
 # Install python 3.12 via uv (CUDA base image does not ship it), plus the same
 # system packages as the CPU image.
@@ -49,9 +50,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen
 
 # Bake the small model into the Hugging Face cache layer of the image.
-ENV WHISPER_MODEL=small \
-    WHISPER_DEVICE=cuda
+# WHISPER_DEVICE is intentionally unset here; preload uses CPU so builds work
+# without GPU access. Runtime CUDA defaults are set after the cache is baked.
+ENV WHISPER_MODEL=small
 RUN uv run python scripts/preload_whisper_model.py
+
+ENV WHISPER_DEVICE=cuda
 
 EXPOSE 8000
 
