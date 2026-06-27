@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn[standard]",
     "pydantic-settings",
     "numpy",
+    "openai",
 ]
 
 [project.scripts]

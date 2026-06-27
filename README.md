@@ -57,7 +57,7 @@ src/autobot_stt/
 │   ├── auth.py          # verify_api_key (Bearer auth on /v1/*)
 │   └── store.py         # get_session_store (app.state singleton)
 └── routes/
-    └── sessions.py      # POST /v1/sessions, DELETE /v1/sessions/{id}
+    └── sessions.py      # POST /v1/sessions, DELETE /v1/sessions/{id}, POST /v1/sessions/{id}/finalize
 tests/
 ├── fixtures/
 │   └── sample.webm      # tiny WebM/Opus clip for decoder tests
@@ -86,6 +86,7 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_app.py` | OpenAPI schema shape, `run()` delegates to uvicorn with correct args |
 | `test_audio_decoder.py` | WebM/Opus decode to mono float32 PCM, sample-rate handling, error paths; skips when ffmpeg is absent |
 | `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
+| `test_finalize.py` | LLM finalize endpoint: success, 400/401/404/503, session deletion, OpenAI payload |
 | `test_auth.py` | Bearer auth enforced on `/v1/*` when `STT_API_KEY` set; skipped when empty |
 
 ## Lint
@@ -163,6 +164,35 @@ curl -X DELETE http://localhost:8000/v1/sessions/<session_id> \
   -H "Authorization: Bearer $STT_API_KEY"
 # HTTP/1.1 204 No Content  (404 if unknown)
 ```
+
+### Finalize a session
+
+Takes the session's raw Whisper transcript plus stored context (`draft_text`,
+`chat_history`, `comments`), calls OpenAI `gpt-4o-mini` to fix transcription
+errors, returns the cleaned text for appending to the user's draft, then
+deletes the session.
+
+```bash
+curl -X POST http://localhost:8000/v1/sessions/<session_id>/finalize \
+  -H "Authorization: Bearer $STT_API_KEY"
+# HTTP/1.1 200 OK
+# {"text":"cleaned text","raw_transcript":"original whisper output"}
+```
+
+Status codes:
+
+| Status | Condition |
+|--------|-----------|
+| `200` | Cleaned text returned; session deleted |
+| `400` | Session exists but `raw_transcript` is empty/whitespace |
+| `401` | Missing or invalid Bearer token (when `STT_API_KEY` set) |
+| `404` | Session not found |
+| `503` | `OPENAI_API_KEY` not configured |
+
+The LLM prompt is built by `autobot_stt.services.llm_cleanup.cleanup_transcript`.
+The model is hard-coded to `gpt-4o-mini` and is instructed to output **only**
+the corrected spoken text (not the full draft), preserving technical terms
+and meaning from chat history and comments.
 
 ### Authentication
 
