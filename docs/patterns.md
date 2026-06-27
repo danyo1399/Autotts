@@ -178,6 +178,54 @@ Notes:
   picked up. The `conftest._clear_settings_cache` autouse fixture clears
   the cache before and after every test to prevent leakage.
 
+## WebSocket auth (separate from REST Bearer)
+
+The WebSocket stream route (`routes/stream.py`) cannot share the router-scoped
+`verify_api_key` dependency: WS clients authenticate via `?token=` query
+parameter (or `Authorization` header in the handshake), and failure must
+surface as a close frame (code 4401), not an HTTP 401.
+
+**Why:** REST auth raises `HTTPException(401)` from a `Depends` chain that
+runs after the request has been fully received. A WebSocket handshake has to
+choose between `accept()` (proceed) and `close(code=...)` (reject) before
+any application-level messages flow, so the handler must run its own check
+and close with a WS-specific code.
+
+**How:**
+
+- `v1_router` is split: REST routes (`sessions_router`) keep
+  `dependencies=[Depends(verify_api_key)]`; the stream route is mounted on
+  `v1_router` without router-level auth.
+- `dependencies/auth.py::check_ws_api_key(websocket, token, settings) -> bool`
+  is called as a plain function (not via `Depends`) at the top of the
+  handler. Returning `False` triggers `await websocket.close(code=4401)`.
+- Unknown sessions close with code `4404`.
+- When `STT_API_KEY` is empty, `check_ws_api_key` returns `True` and the
+  handler proceeds (dev mode parity with REST).
+
+## Blocking work off the event loop (`asyncio.to_thread`)
+
+`decode_webm_opus_to_pcm` shells out to ffmpeg (subprocess) and
+`WhisperService.transcribe` runs CPU/GPU inference. Both are synchronous
+and would block the event loop, starving other WebSocket connections.
+
+**Why:** FastAPI/Starlette runs the handler on a single event loop; a
+blocking call inside a handler stalls every concurrent request. The decode
+and transcribe calls are offloaded to a worker thread via
+`asyncio.to_thread`, yielding control back to the loop between operations.
+
+**How:** The stream handler wraps the calls:
+
+```python
+pcm = await asyncio.to_thread(decode_webm_opus_to_pcm, batch)
+async with app.state.whisper_lock:
+    text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
+```
+
+`faster-whisper`'s model instance is not safe for concurrent transcribe
+calls, so an `asyncio.Lock` (`app.state.whisper_lock`, created in lifespan)
+serializes access across connections.
+
 ## Pydantic schemas vs. domain models
 
 HTTP request/response payloads use thin Pydantic `BaseModel` classes

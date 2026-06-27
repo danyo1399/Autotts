@@ -58,7 +58,8 @@ src/autobot_stt/
 │   ├── auth.py             # verify_api_key (Bearer auth on /v1/*)
 │   └── store.py            # get_session_store (app.state singleton)
 └── routes/
-    └── sessions.py         # POST /v1/sessions, DELETE /v1/sessions/{id}
+    ├── sessions.py         # POST /v1/sessions, DELETE /v1/sessions/{id}
+    └── stream.py           # WS /v1/sessions/{id}/stream — live transcription
 tests/
 ├── fixtures/
 │   └── sample.webm         # tiny WebM/Opus clip for decoder tests
@@ -90,6 +91,7 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
 | `test_auth.py` | Bearer auth enforced on `/v1/*` when `STT_API_KEY` set; skipped when empty |
 | `test_whisper_service.py` | `build_initial_prompt` logic, mocked `WhisperModel.load`/`transcribe`, beam size/VAD kwargs, empty/multi-dim input handling |
+| `test_stream.py` | WebSocket streaming: `ready` handshake, partial transcripts, auth (4401 on failure, token query/Bearer), 4404 unknown session, decode error events |
 
 ## Lint
 
@@ -207,8 +209,61 @@ curl -X DELETE http://localhost:8000/v1/sessions/<session_id> \
 ### Authentication
 
 - Header: `Authorization: Bearer <STT_API_KEY>`
-- Applied to all `/v1/*` routes. `/health`, `/docs`, `/openapi.json` remain open.
+- Applied to REST routes under `/v1/*`. `/health`, `/docs`, `/openapi.json`, and
+  the WebSocket stream route remain open at the router level — the stream
+  handler enforces auth itself (see below).
 - Missing or wrong token returns `401 Unauthorized`.
+
+## WebSocket streaming
+
+Live transcription is exposed as a WebSocket endpoint. Clients send binary
+WebM/Opus chunks (as produced by a browser `MediaRecorder`); the server
+decodes, runs Whisper incrementally, emits partial transcript events, and
+accumulates the full transcript on the session.
+
+### Connect
+
+```
+WS /v1/sessions/{session_id}/stream?token=<STT_API_KEY>
+```
+
+Authentication accepts either:
+
+- `token` query parameter, **or**
+- `Authorization: Bearer <STT_API_KEY>` header
+
+When `STT_API_KEY` is empty/unset, auth is skipped (dev mode). On auth
+failure the server closes the socket with code **4401** before sending any
+messages; an unknown `session_id` closes with code **4404**.
+
+### Server → client messages (JSON text frames)
+
+```json
+{ "type": "ready", "session_id": "..." }
+{ "type": "partial_transcript", "text": "...", "is_final": false }
+{ "type": "error", "message": "..." }
+```
+
+`partial_transcript.text` is the **cumulative** `session.raw_transcript`
+after each transcription pass; `is_final` is always `false` in this subtask
+(finalization is subtask 7).
+
+### Client → server
+
+Binary frames only — WebM/Opus audio chunks from `MediaRecorder`. Text
+frames are ignored.
+
+### Streaming behavior
+
+The server buffers incoming WebM bytes. Every ~2 seconds of decoded audio
+(or after a 1.5 s silence window with no new chunks), it decodes the batch,
+runs Whisper under a process-wide `asyncio.Lock` (the model is not safe for
+parallel calls), appends the new text to `session.raw_transcript`, and
+emits a `partial_transcript` event. Decode and transcribe run in
+`asyncio.to_thread` so the event loop is not blocked.
+
+On client disconnect the session and accumulated transcript are preserved;
+finalization happens via the REST API in subtask 7.
 
 ## Configuration
 
