@@ -37,6 +37,45 @@ uv run autobot-stt
 
 The server listens on `http://localhost:8000`.
 
+## API
+
+All endpoints are documented interactively at `/docs` (Swagger UI) and
+`/openapi.json` once the server is running. REST routes under `/v1/*` require
+a Bearer token when `STT_API_KEY` is set; the WebSocket route accepts the same
+token via the `?token=` query param or `Authorization` header. See
+**Authentication** under [Sessions API](#authentication) for details.
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET` | `/health` | none | Service health probe |
+| `POST` | `/v1/sessions` | Bearer | Create a transcription session with draft text, chat history, comments |
+| `DELETE` | `/v1/sessions/{session_id}` | Bearer | Delete a session and its transcript |
+| `WS` | `/v1/sessions/{session_id}/stream` | `?token=` / Bearer | Stream WebM/Opus audio; emit partial transcripts |
+| `POST` | `/v1/sessions/{session_id}/finalize` | Bearer | Run OpenAI cleanup on the transcript; returns cleaned text and deletes the session |
+
+### Create a session
+
+```bash
+curl -X POST http://localhost:8000/v1/sessions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $STT_API_KEY" \
+  -d '{"draft_text":"hello","chat_history":[],"comments":[]}'
+# HTTP/1.1 201 Created
+# {"session_id":"<uuid4>"}
+```
+
+### Finalize a session
+
+```bash
+curl -X POST http://localhost:8000/v1/sessions/<session_id>/finalize \
+  -H "Authorization: Bearer $STT_API_KEY"
+# HTTP/1.1 200 OK
+# {"text":"cleaned text","raw_transcript":"original whisper output"}
+```
+
+See [Sessions API](#sessions-api) for the full request/response contract and
+[WebSocket streaming](#websocket-streaming) for the live transcription protocol.
+
 ## Project structure
 
 ```
@@ -63,6 +102,10 @@ src/autobot_stt/
 tests/
 ├── fixtures/
 │   └── sample.webm               # tiny WebM/Opus clip for decoder tests
+├── integration/
+│   ├── __init__.py
+│   ├── conftest.py               # integration fixtures: mocked whisper/decoder/openai
+│   └── test_session_lifecycle.py # full create -> stream -> finalize -> cleanup E2E
 ├── conftest.py                   # shared fixtures: client, store override, auth_headers
 ├── test_health.py                # async health endpoint tests (httpx.AsyncClient)
 ├── test_config.py                # settings defaults, env loading, LogLevel validation
@@ -73,6 +116,7 @@ tests/
 ├── test_dependencies_auth.py     # WebSocket auth helpers: token extraction, key validation
 ├── test_dependencies_store.py    # DI accessors: session store, whisper service/lock errors
 ├── test_stream.py                # WebSocket streaming endpoint integration tests
+├── test_finalize.py              # Finalize endpoint + cleanup_transcript unit tests
 ├── test_whisper_service.py       # build_initial_prompt + mocked transcribe tests
 ├── test_preload_whisper_model.py # GPU build-time preload script (cache check, CPU/int8)
 └── test_docker_config.py         # docker-compose / Dockerfile / .dockerignore integration
@@ -85,13 +129,16 @@ uv run pytest
 ```
 
 Tests use `pytest-asyncio` (async tests marked with `@pytest.mark.asyncio`)
-and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
+and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app. Integration
+tests are marked `@pytest.mark.integration` and run in the default `uv run pytest`
+invocation — Whisper, the audio decoder, and OpenAI are all mocked so they
+require no ffmpeg, GPU, or network access.
 
 | Test file | What it covers |
 |-----------|----------------|
 | `test_health.py` | Health endpoint returns 200, JSON content-type, app metadata |
 | `test_config.py` | Settings defaults, env overrides, `get_settings()` caching, `LogLevel` validation |
-| `test_app.py` | OpenAPI schema shape, `run()` delegates to uvicorn with correct args, lifespan loads/releases `WhisperService` |
+| `test_app.py` | OpenAPI schema shape, run() delegates to uvicorn with correct args, lifespan loads/releases `WhisperService` |
 | `test_audio_decoder.py` | WebM/Opus decode to mono float32 PCM, sample-rate handling, error paths; skips when ffmpeg is absent |
 | `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
 | `test_finalize.py` | LLM finalize endpoint: success, 400/404/502/503, session deletion (incl. preserved on OpenAI error), empty-text response, OpenAI payload, `cleanup_transcript` unit tests (whitespace strip, empty choices, None content, error propagation, api_key + timeout passthrough, empty-context placeholders) |
@@ -102,6 +149,7 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_preload_whisper_model.py` | GPU build-time preload: `_expected_cache_dir()` paths, `main()` CPU/int8 hardcoding, cache-miss exit code |
 | `test_docker_config.py` | `docker-compose.yml` shape, `Dockerfile` / `Dockerfile.gpu` defaults and preload ordering, `.dockerignore` patterns, real `docker compose config` validation |
 | `test_stream.py` | WebSocket streaming: `ready` handshake, partial transcripts (incremental + cumulative), auth (4401, query-token, Bearer-header, key-empty bypass), 4404 unknown session, decode/ffmpeg/whisper error events, threshold-gated flushes, text-frame ignore, silence-timeout no-op |
+| `integration/test_session_lifecycle.py` | Full E2E lifecycle (create → stream → finalize → cleanup) with mocked Whisper/decoder/OpenAI |
 
 ## Lint
 
