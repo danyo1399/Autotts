@@ -8,8 +8,10 @@ designed to stream microphone audio to text via REST and WebSocket endpoints
 
 - **Python** 3.12 or newer
 - **[uv](https://docs.astral.sh/uv/)** for dependency management
-- **ffmpeg** — required at runtime once audio decoding lands (subtask 4+);
-  not needed for the health check in this subtask
+- **ffmpeg** — required for audio decoding (WebM/Opus → PCM). Install:
+  - Debian/Ubuntu: `sudo apt install ffmpeg`
+  - macOS: `brew install ffmpeg`
+  - Verify: `ffmpeg -version`
 
 ## Setup
 
@@ -42,11 +44,17 @@ The server listens on `http://localhost:8000`.
 src/autobot_stt/
 ├── __init__.py          # package version (single source of truth)
 ├── main.py              # FastAPI app factory, /health endpoint, uvicorn entry
-└── config.py            # pydantic-settings config, cached singleton
+├── config.py            # pydantic-settings config, cached singleton
+└── services/
+    ├── __init__.py
+    └── audio_decoder.py # WebM/Opus -> 16 kHz mono PCM (ffmpeg)
 tests/
+├── fixtures/
+│   └── sample.webm      # tiny WebM/Opus clip for decoder tests
 ├── test_health.py       # async health endpoint tests (httpx.AsyncClient)
 ├── test_config.py       # settings defaults, env loading, LogLevel validation
-└── test_app.py          # OpenAPI schema, metadata, run() entry point tests
+├── test_app.py          # OpenAPI schema, metadata, run() entry point tests
+└── test_audio_decoder.py # audio decoder success, sample rate, error paths
 ```
 
 ## Test
@@ -63,11 +71,29 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_health.py` | Health endpoint returns 200, JSON content-type, app metadata |
 | `test_config.py` | Settings defaults, env overrides, `get_settings()` caching, `LogLevel` validation |
 | `test_app.py` | OpenAPI schema shape, `run()` delegates to uvicorn with correct args |
+| `test_audio_decoder.py` | WebM/Opus decode to mono float32 PCM, sample-rate handling, error paths; skips when ffmpeg is absent |
 
 ## Lint
 
 ```bash
 uv run ruff check .
+```
+
+## Audio decoding
+
+`autobot_stt.services.audio_decoder.decode_webm_opus_to_pcm` converts the
+WebM/Opus byte chunks produced by a browser `MediaRecorder` into a 1-D
+`numpy.float32` array normalized to `[-1, 1]` and resampled to 16 kHz mono.
+The array is ready to hand to the Whisper service (subtask 5).
+
+The function shells out to `ffmpeg` over stdin/stdout — no temp files. A
+missing or misconfigured input raises `AudioDecodeError`; if ffmpeg itself is
+not installed, `FileNotFoundError` propagates to the caller.
+
+```python
+from autobot_stt.services.audio_decoder import decode_webm_opus_to_pcm
+
+pcm = decode_webm_opus_to_pcm(webm_bytes)  # -> np.ndarray, 16 kHz mono float32
 ```
 
 ## Health check

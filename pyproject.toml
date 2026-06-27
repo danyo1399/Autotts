@@ -8,6 +8,7 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "pydantic-settings",
+    "numpy",
 ]
 
 [project.scripts]
