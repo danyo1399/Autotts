@@ -44,3 +44,6 @@ select = ["E", "F", "I", "UP"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: end-to-end tests spanning multiple endpoints (mocked externals)",
+]

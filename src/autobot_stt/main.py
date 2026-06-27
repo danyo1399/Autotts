@@ -37,10 +37,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("Whisper model released")
 
 
-app = FastAPI(title="autobot-stt", version=__version__, lifespan=lifespan)
+app = FastAPI(
+    title="autobot-stt",
+    version=__version__,
+    lifespan=lifespan,
+    openapi_tags=[
+        {"name": "health", "description": "Service health and readiness."},
+        {"name": "sessions", "description": "Session lifecycle: create, finalize, delete."},
+        {
+            "name": "streaming",
+            "description": "WebSocket live audio streaming and partial transcripts.",
+        },
+    ],
+)
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    tags=["health"],
+    summary="Health check",
+    description="Returns service availability. No authentication required.",
+)
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 

@@ -18,7 +18,16 @@ from autobot_stt.stores.base import SessionStore
 router = APIRouter(tags=["sessions"])
 
 
-@router.post("/sessions", status_code=201, response_model=CreateSessionResponse)
+@router.post(
+    "/sessions",
+    status_code=201,
+    response_model=CreateSessionResponse,
+    summary="Create session",
+    description=(
+        "Create a transcription session with draft text, chat history, and "
+        "comments for context-aware STT."
+    ),
+)
 async def create_session(
     body: CreateSessionRequest,
     store: SessionStore = Depends(get_session_store),
@@ -34,7 +43,15 @@ async def create_session(
     return CreateSessionResponse(session_id=session.id)
 
 
-@router.delete("/sessions/{session_id}", status_code=204)
+@router.delete(
+    "/sessions/{session_id}",
+    status_code=204,
+    summary="Delete session",
+    description=(
+        "Remove a session and its accumulated transcript. Returns 404 if the "
+        "session does not exist."
+    ),
+)
 async def delete_session(
     session_id: str,
     store: SessionStore = Depends(get_session_store),
@@ -48,6 +65,11 @@ async def delete_session(
 @router.post(
     "/sessions/{session_id}/finalize",
     response_model=FinalizeSessionResponse,
+    summary="Finalize session",
+    description=(
+        "Run OpenAI cleanup on the raw transcript using session context; "
+        "returns cleaned text and deletes the session."
+    ),
 )
 async def finalize_session(
     session_id: str,

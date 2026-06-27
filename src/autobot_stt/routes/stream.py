@@ -22,7 +22,7 @@ from autobot_stt.stores.base import SessionStore
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["stream"])
+router = APIRouter(tags=["streaming"])
 
 STREAM_CHUNK_SECONDS = 2
 STREAM_SILENCE_TIMEOUT_SECONDS = 1.5

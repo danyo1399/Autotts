@@ -25,6 +25,47 @@ def test_openapi_schema_includes_sessions_endpoints() -> None:
     assert "post" in paths["/v1/sessions/{session_id}/finalize"]
 
 
+def test_openapi_components_include_session_models() -> None:
+    schemas = app.openapi()["components"]["schemas"]
+    assert "CreateSessionRequest" in schemas
+    assert "CreateSessionResponse" in schemas
+    assert "FinalizeSessionResponse" in schemas
+
+
+def test_openapi_session_routes_have_summaries_and_tags() -> None:
+    paths = app.openapi()["paths"]
+    create = paths["/v1/sessions"]["post"]
+    assert create["summary"]
+    assert "sessions" in create["tags"]
+    assert (
+        create["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/CreateSessionRequest"
+    )
+
+    delete = paths["/v1/sessions/{session_id}"]["delete"]
+    assert delete["summary"]
+    assert "sessions" in delete["tags"]
+
+    finalize = paths["/v1/sessions/{session_id}/finalize"]["post"]
+    assert finalize["summary"]
+    assert "sessions" in finalize["tags"]
+    assert (
+        finalize["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/FinalizeSessionResponse"
+    )
+
+
+def test_openapi_health_has_summary_and_health_tag() -> None:
+    health = app.openapi()["paths"]["/health"]["get"]
+    assert health["summary"]
+    assert "health" in health["tags"]
+
+
+def test_openapi_tag_metadata_includes_health_sessions_streaming() -> None:
+    tag_names = {t["name"] for t in app.openapi()["tags"]}
+    assert {"health", "sessions", "streaming"} <= tag_names
+
+
 def test_run_invokes_uvicorn_with_expected_args() -> None:
     with patch("autobot_stt.main.uvicorn") as uvicorn_mock:
         run()
