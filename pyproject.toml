@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn[standard]",
     "pydantic-settings",
     "numpy",
+    "faster-whisper",
 ]
 
 [project.scripts]
