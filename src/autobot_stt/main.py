@@ -22,9 +22,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.whisper_lock = asyncio.Lock()
 
     settings = get_settings()
+    if not settings.stt_api_key:
+        logger.warning("STT_API_KEY unset — auth disabled on /v1/* (do not deploy to production)")
     service = WhisperService(settings)
     logger.info(
-        "Loading Whisper model model=%s device=%s",
+        "Loading Whisper model=%s device=%s",
         settings.whisper_model,
         settings.whisper_device,
     )
@@ -79,5 +81,4 @@ def run() -> None:
         "autobot_stt.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
     )

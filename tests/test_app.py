@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from autobot_stt.config import get_settings
 from autobot_stt.main import app, run
 from autobot_stt.services.whisper_service import WhisperService
 
@@ -61,7 +62,6 @@ def test_run_invokes_uvicorn_with_expected_args() -> None:
         "autobot_stt.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
     )
 
 
@@ -88,3 +88,36 @@ async def test_lifespan_releases_whisper_service_on_shutdown(
     async with app.router.lifespan_context(app):
         assert app.state.whisper_service._model is not None
     assert app.state.whisper_service._model is None
+
+
+@pytest.mark.asyncio
+@patch("autobot_stt.services.whisper_service.WhisperModel")
+async def test_lifespan_warns_when_stt_api_key_unset(
+    mock_model_cls: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("STT_API_KEY", raising=False)
+    get_settings.cache_clear()
+    with caplog.at_level("WARNING", logger="autobot_stt.main"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert any(
+        "STT_API_KEY unset" in record.message and record.levelname == "WARNING"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@patch("autobot_stt.services.whisper_service.WhisperModel")
+async def test_lifespan_no_warn_when_stt_api_key_set(
+    mock_model_cls: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("STT_API_KEY", "configured-key")
+    get_settings.cache_clear()
+    with caplog.at_level("WARNING", logger="autobot_stt.main"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert not any("STT_API_KEY unset" in record.message for record in caplog.records)

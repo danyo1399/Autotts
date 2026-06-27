@@ -81,16 +81,12 @@ async def stream_session(
                 return True
             logger.warning("audio decode failed: %s", exc)
             webm_buffer.clear()
-            await websocket.send_json(
-                {"type": "error", "message": "Failed to decode audio"}
-            )
+            await websocket.send_json({"type": "error", "message": "Failed to decode audio"})
             return True
         except FileNotFoundError:
             logger.error("ffmpeg unavailable; cannot decode audio")
             webm_buffer.clear()
-            await websocket.send_json(
-                {"type": "error", "message": "Audio decoder unavailable"}
-            )
+            await websocket.send_json({"type": "error", "message": "Audio decoder unavailable"})
             return True
 
         if not force and len(pcm) < STREAM_FLUSH_SAMPLES:
@@ -162,6 +158,8 @@ async def _transcribe_and_emit(
     # future await between these statements would let two concurrent
     # connections to the same session interleave and lose text. Locking
     # makes the critical section unambiguously safe.
+    transcribe_error = False
+    cumulative: str | None = None
     async with whisper_lock:
         if await store.get(session.id) is None:
             return False
@@ -170,30 +168,30 @@ async def _transcribe_and_emit(
             text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
         except Exception:  # noqa: BLE001 - log and recover, do not crash stream
             logger.exception("whisper transcribe failed")
-            await websocket.send_json(
-                {"type": "error", "message": "Transcription failed"}
-            )
-            return True
+            transcribe_error = True
+        else:
+            if text:
+                if await store.get(session.id) is None:
+                    return False
+                if session.raw_transcript:
+                    session.raw_transcript += " "
+                session.raw_transcript += text
+                session.partial_transcripts.append(text)
+                cumulative = session.raw_transcript
 
-        if not text:
-            return True
+    # Send outside the lock so a slow client cannot stall other transcriptions.
+    if transcribe_error:
+        await websocket.send_json({"type": "error", "message": "Transcription failed"})
+        return True
 
-        if await store.get(session.id) is None:
-            return False
-
-        if session.raw_transcript:
-            session.raw_transcript += " "
-        session.raw_transcript += text
-        session.partial_transcripts.append(text)
-        cumulative = session.raw_transcript
-
-    await websocket.send_json(
-        {
-            "type": "partial_transcript",
-            "text": cumulative,
-            "is_final": False,
-        }
-    )
+    if cumulative is not None:
+        await websocket.send_json(
+            {
+                "type": "partial_transcript",
+                "text": cumulative,
+                "is_final": False,
+            }
+        )
     return True
 
 
