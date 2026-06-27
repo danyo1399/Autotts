@@ -42,32 +42,34 @@ The server listens on `http://localhost:8000`.
 
 ```
 src/autobot_stt/
-├── __init__.py          # package version (single source of truth)
-├── main.py              # FastAPI app factory, /health endpoint, uvicorn entry
-├── config.py            # pydantic-settings config, cached singleton
+├── __init__.py             # package version (single source of truth)
+├── main.py                 # FastAPI app factory, lifespan, /health, uvicorn entry
+├── config.py               # pydantic-settings config, cached singleton
 ├── services/
 │   ├── __init__.py
-│   └── audio_decoder.py # WebM/Opus -> 16 kHz mono PCM (ffmpeg)
+│   ├── audio_decoder.py    # WebM/Opus -> 16 kHz mono PCM (ffmpeg)
+│   └── whisper_service.py  # faster-whisper wrapper + build_initial_prompt
 ├── models/
-│   └── session.py       # ChatMessage, Comment, Session, request/response schemas
+│   └── session.py          # ChatMessage, Comment, Session, request/response schemas
 ├── stores/
-│   ├── base.py          # SessionStore Protocol
-│   └── memory.py        # InMemorySessionStore (asyncio.Lock-guarded dict)
+│   ├── base.py             # SessionStore Protocol
+│   └── memory.py           # InMemorySessionStore (asyncio.Lock-guarded dict)
 ├── dependencies/
-│   ├── auth.py          # verify_api_key (Bearer auth on /v1/*)
-│   └── store.py         # get_session_store (app.state singleton)
+│   ├── auth.py             # verify_api_key (Bearer auth on /v1/*)
+│   └── store.py            # get_session_store (app.state singleton)
 └── routes/
-    └── sessions.py      # POST /v1/sessions, DELETE /v1/sessions/{id}
+    └── sessions.py         # POST /v1/sessions, DELETE /v1/sessions/{id}
 tests/
 ├── fixtures/
-│   └── sample.webm      # tiny WebM/Opus clip for decoder tests
-├── conftest.py          # shared fixtures: client, store override, auth_headers
-├── test_health.py       # async health endpoint tests (httpx.AsyncClient)
-├── test_config.py       # settings defaults, env loading, LogLevel validation
-├── test_app.py          # OpenAPI schema, metadata, run() entry point tests
-├── test_audio_decoder.py # audio decoder success, sample rate, error paths
-├── test_sessions.py     # POST/DELETE session REST contract
-└── test_auth.py         # Bearer auth enforcement on /v1/*
+│   └── sample.webm         # tiny WebM/Opus clip for decoder tests
+├── conftest.py             # shared fixtures: client, store override, auth_headers
+├── test_health.py          # async health endpoint tests (httpx.AsyncClient)
+├── test_config.py          # settings defaults, env loading, LogLevel validation
+├── test_app.py             # OpenAPI schema, run(), lifespan wiring tests
+├── test_audio_decoder.py   # audio decoder success, sample rate, error paths
+├── test_sessions.py        # POST/DELETE session REST contract
+├── test_auth.py            # Bearer auth enforcement on /v1/*
+└── test_whisper_service.py # build_initial_prompt + mocked transcribe tests
 ```
 
 ## Test
@@ -83,10 +85,11 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 |-----------|----------------|
 | `test_health.py` | Health endpoint returns 200, JSON content-type, app metadata |
 | `test_config.py` | Settings defaults, env overrides, `get_settings()` caching, `LogLevel` validation |
-| `test_app.py` | OpenAPI schema shape, `run()` delegates to uvicorn with correct args |
+| `test_app.py` | OpenAPI schema shape, `run()` delegates to uvicorn with correct args, lifespan loads/releases `WhisperService` |
 | `test_audio_decoder.py` | WebM/Opus decode to mono float32 PCM, sample-rate handling, error paths; skips when ffmpeg is absent |
 | `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
 | `test_auth.py` | Bearer auth enforced on `/v1/*` when `STT_API_KEY` set; skipped when empty |
+| `test_whisper_service.py` | `build_initial_prompt` logic, mocked `WhisperModel.load`/`transcribe`, beam size/VAD kwargs, empty/multi-dim input handling |
 
 ## Lint
 
@@ -120,6 +123,43 @@ not installed, `FileNotFoundError` propagates to the caller.
 from autobot_stt.services.audio_decoder import decode_webm_opus_to_pcm
 
 pcm = decode_webm_opus_to_pcm(webm_bytes)  # -> np.ndarray, 16 kHz mono float32
+```
+
+## Whisper STT
+
+`autobot_stt.services.whisper_service.WhisperService` wraps
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) for local speech
+transcription. The model is loaded once in the FastAPI lifespan startup and
+stored on `app.state.whisper_service` so subsequent requests can reuse it.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WHISPER_MODEL` | `base` | faster-whisper model size (`base` for dev/CI, `small` for production) |
+| `WHISPER_DEVICE` | `cpu` | `cpu` or `cuda`. `compute_type` is derived (`int8` on CPU, `float16` on CUDA) |
+
+**First-run download.** faster-whisper pulls model weights from the Hugging Face
+Hub on first use and caches them under `~/.cache/huggingface/hub`. Approximate
+sizes: ~150 MB for `base`, ~500 MB for `small`.
+
+**Transcription defaults.** `WhisperService.transcribe()` calls
+`WhisperModel.transcribe()` with `beam_size=5` and `vad_filter=True`, then
+concatenates the segment texts. Empty input returns `""` without invoking the
+model.
+
+**Initial prompt.** `build_initial_prompt(draft_text, chat_history)` assembles
+a context string from the user's current draft plus the last few chat messages
+(capped at ~800 characters / ~224 tokens, preserving the most recent tail). The
+WebSocket route (subtask 6) passes this string as Whisper's `initial_prompt` to
+bias decoding toward in-domain vocabulary.
+
+```python
+from autobot_stt.services.whisper_service import build_initial_prompt
+
+prompt = build_initial_prompt(
+    draft_text="meeting notes",
+    chat_history=[{"role": "user", "content": "discuss Q3 roadmap"}],
+)
+text = app.state.whisper_service.transcribe(pcm_array, initial_prompt=prompt or None)
 ```
 
 ## Health check

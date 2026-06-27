@@ -1,6 +1,10 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
+from httpx import ASGITransport, AsyncClient
 
 from autobot_stt.main import app, run
+from autobot_stt.services.whisper_service import WhisperService
 
 
 def test_openapi_schema_includes_health() -> None:
@@ -28,3 +32,28 @@ def test_run_invokes_uvicorn_with_expected_args() -> None:
         port=8000,
         reload=True,
     )
+
+
+@pytest.mark.asyncio
+@patch("autobot_stt.services.whisper_service.WhisperModel")
+async def test_lifespan_loads_whisper_service(mock_model_cls: MagicMock) -> None:
+    async with app.router.lifespan_context(app):
+        assert hasattr(app.state, "whisper_service")
+        assert isinstance(app.state.whisper_service, WhisperService)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/health")
+            assert response.status_code == 200
+    mock_model_cls.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("autobot_stt.services.whisper_service.WhisperModel")
+async def test_lifespan_releases_whisper_service_on_shutdown(
+    mock_model_cls: MagicMock,
+) -> None:
+    async with app.router.lifespan_context(app):
+        assert app.state.whisper_service._model is not None
+    assert app.state.whisper_service._model is None
