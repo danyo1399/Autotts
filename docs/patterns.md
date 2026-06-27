@@ -135,6 +135,66 @@ with no route changes.
 `InMemorySessionStore` uses an `asyncio.Lock` to serialize dict mutation so
 concurrent `create`/`delete` calls cannot corrupt the dict.
 
+## External API error handling: OpenAI
+
+Calls to external APIs (currently the OpenAI transcript-cleanup service) use a
+consistent error-handling pattern:
+
+**Map SDK exceptions to HTTP 502.** OpenAI raises `openai.OpenAIError` for
+rate limits, 5xx, network failures, and invalid keys. The route catches it and
+returns `502 Bad Gateway` with a descriptive message. The session is **not**
+deleted on error — the caller can retry.
+
+**Timeout configuration.** The OpenAI client is created with an explicit
+`timeout` kwarg (currently 30 s in `_TIMEOUT_SECONDS`). This prevents a hung
+API call from blocking the server indefinitely.
+
+**Async context manager.** The client is used via `async with
+AsyncOpenAI(...) as client` to guarantee proper connection cleanup.
+
+**Why:** Without a timeout, a stuck connection holds the worker forever.
+Without the 502→preserve pattern, a transient OpenAI failure destroys the
+user's session and transcript — they'd have to re-record.
+
+**How:**
+```python
+_TIMEOUT_SECONDS = 30.0
+
+async with AsyncOpenAI(api_key=api_key, timeout=_TIMEOUT_SECONDS) as client:
+    response = await client.chat.completions.create(...)
+```
+
+Route layer:
+```python
+try:
+    cleaned = await cleanup_transcript(session, api_key=settings.openai_api_key)
+except OpenAIError as exc:
+    raise HTTPException(status_code=502, detail=f"Cleanup failed: {exc}") from exc
+# Only delete session on success
+await store.delete(session_id)
+```
+
+## Guarding against empty API responses
+
+When calling LLM APIs, handle two edge cases that the SDK types permit:
+
+1. **Empty choices list** — the API returns success but no completions.
+2. **`None` message content** — the choice exists but `message.content` is
+   `None` (e.g. a tool-call-only response or streaming edge case).
+
+Both cases return `""` rather than crashing.
+
+**Why:** The OpenAI SDK types allow these values. Without explicit guards a
+`None` content value would produce `"None"` (stringified) in the response.
+
+**How:**
+```python
+if not response.choices:
+    return ""
+content = response.choices[0].message.content or ""
+return content.strip()
+```
+
 ## Router-scoped Bearer auth
 
 Authentication is enforced on `/v1/*` via a `verify_api_key` FastAPI

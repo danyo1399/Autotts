@@ -47,7 +47,8 @@ src/autobot_stt/
 ├── config.py            # pydantic-settings config, cached singleton
 ├── services/
 │   ├── __init__.py
-│   └── audio_decoder.py # WebM/Opus -> 16 kHz mono PCM (ffmpeg)
+│   ├── audio_decoder.py # WebM/Opus -> 16 kHz mono PCM (ffmpeg)
+│   └── llm_cleanup.py   # OpenAI gpt-4o-mini transcript cleanup
 ├── models/
 │   └── session.py       # ChatMessage, Comment, Session, request/response schemas
 ├── stores/
