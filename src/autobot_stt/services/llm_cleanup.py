@@ -7,6 +7,7 @@ from openai import AsyncOpenAI
 from autobot_stt.models.session import ChatMessage, Comment, Session
 
 _MODEL = "gpt-4o-mini"
+_TIMEOUT_SECONDS = 30.0
 
 _SYSTEM_PROMPT = (
     "You correct speech-to-text transcription errors. You receive the user's "
@@ -58,7 +59,7 @@ async def cleanup_transcript(session: Session, *, api_key: str) -> str:
     Raises:
         openai.OpenAIError: Propagated from the OpenAI API call.
     """
-    async with AsyncOpenAI(api_key=api_key) as client:
+    async with AsyncOpenAI(api_key=api_key, timeout=_TIMEOUT_SECONDS) as client:
         response = await client.chat.completions.create(
             model=_MODEL,
             messages=[

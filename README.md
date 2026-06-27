@@ -86,7 +86,7 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_app.py` | OpenAPI schema shape, `run()` delegates to uvicorn with correct args |
 | `test_audio_decoder.py` | WebM/Opus decode to mono float32 PCM, sample-rate handling, error paths; skips when ffmpeg is absent |
 | `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
-| `test_finalize.py` | LLM finalize endpoint: success, 400/404/503, session deletion, empty-text response, OpenAI payload, `cleanup_transcript` unit tests (whitespace strip, empty choices, None content, error propagation, api_key passthrough, empty-context placeholders) |
+| `test_finalize.py` | LLM finalize endpoint: success, 400/404/502/503, session deletion (incl. preserved on OpenAI error), empty-text response, OpenAI payload, `cleanup_transcript` unit tests (whitespace strip, empty choices, None content, error propagation, api_key + timeout passthrough, empty-context placeholders) |
 | `test_auth.py` | Bearer auth enforced on `/v1/*` when `STT_API_KEY` set; skipped when empty |
 
 ## Lint
@@ -187,6 +187,7 @@ Status codes:
 | `400` | Session exists but `raw_transcript` is empty/whitespace |
 | `401` | Missing or invalid Bearer token (when `STT_API_KEY` set) |
 | `404` | Session not found |
+| `502` | OpenAI call failed (rate limit, 5xx, network, invalid key); session is preserved for retry |
 | `503` | `OPENAI_API_KEY` not configured |
 
 The LLM prompt is built by `autobot_stt.services.llm_cleanup.cleanup_transcript`.

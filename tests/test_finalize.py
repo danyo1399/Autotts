@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from openai import OpenAIError
 
 from autobot_stt.config import get_settings
 from autobot_stt.models.session import ChatMessage, Comment, Session
@@ -134,6 +135,25 @@ async def test_finalize_missing_openai_key_returns_503(
 
 
 @pytest.mark.asyncio
+async def test_finalize_openai_error_returns_502_and_keeps_session(
+    client, session_store, auth_headers, monkeypatch, mock_cleanup
+) -> None:
+    _set_openai_key(monkeypatch)
+    session_id = await _create_session_with_transcript(
+        client, session_store, "hello whisper", auth_headers=auth_headers
+    )
+    mock_cleanup.side_effect = OpenAIError("upstream failure")
+
+    response = await client.post(
+        f"/v1/sessions/{session_id}/finalize", headers=auth_headers
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Transcript cleanup failed: upstream failure"
+    assert await session_store.get(session_id) is not None
+
+
+@pytest.mark.asyncio
 async def test_finalize_returns_empty_text_when_cleanup_yields_empty(
     client, session_store, auth_headers, monkeypatch, mock_cleanup
 ) -> None:
@@ -244,8 +264,6 @@ async def test_cleanup_transcript_none_message_content_returns_empty_string() ->
 
 @pytest.mark.asyncio
 async def test_cleanup_transcript_propagates_openai_error() -> None:
-    from openai import OpenAIError
-
     client_mock = MagicMock()
     client_mock.chat.completions.create = AsyncMock(
         side_effect=OpenAIError("upstream failure")
@@ -259,13 +277,13 @@ async def test_cleanup_transcript_propagates_openai_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_transcript_passes_api_key_to_openai_client() -> None:
+async def test_cleanup_transcript_passes_api_key_and_timeout_to_openai_client() -> None:
     client_mock = _mock_openai_client(content="ok")
 
     with patch.object(llm_cleanup, "AsyncOpenAI", return_value=client_mock) as ctor:
         await llm_cleanup.cleanup_transcript(_build_session(), api_key="sk-secret")
 
-    ctor.assert_called_once_with(api_key="sk-secret")
+    ctor.assert_called_once_with(api_key="sk-secret", timeout=30.0)
 
 
 @pytest.mark.asyncio

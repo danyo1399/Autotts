@@ -2,6 +2,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from openai import OpenAIError
 
 from autobot_stt.config import Settings, get_settings
 from autobot_stt.dependencies.store import get_session_store
@@ -62,6 +63,12 @@ async def finalize_session(
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
     raw_transcript = session.raw_transcript
-    cleaned = await cleanup_transcript(session, api_key=settings.openai_api_key)
+    try:
+        cleaned = await cleanup_transcript(session, api_key=settings.openai_api_key)
+    except OpenAIError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Transcript cleanup failed: {exc}",
+        ) from exc
     await store.delete(session_id)
     return FinalizeSessionResponse(text=cleaned, raw_transcript=raw_transcript)
