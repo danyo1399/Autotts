@@ -61,15 +61,17 @@ src/autobot_stt/
     └── sessions.py         # POST /v1/sessions, DELETE /v1/sessions/{id}
 tests/
 ├── fixtures/
-│   └── sample.webm         # tiny WebM/Opus clip for decoder tests
-├── conftest.py             # shared fixtures: client, store override, auth_headers
-├── test_health.py          # async health endpoint tests (httpx.AsyncClient)
-├── test_config.py          # settings defaults, env loading, LogLevel validation
-├── test_app.py             # OpenAPI schema, run(), lifespan wiring tests
-├── test_audio_decoder.py   # audio decoder success, sample rate, error paths
-├── test_sessions.py        # POST/DELETE session REST contract
-├── test_auth.py            # Bearer auth enforcement on /v1/*
-└── test_whisper_service.py # build_initial_prompt + mocked transcribe tests
+│   └── sample.webm              # tiny WebM/Opus clip for decoder tests
+├── conftest.py                  # shared fixtures: client, store override, auth_headers
+├── test_health.py               # async health endpoint tests (httpx.AsyncClient)
+├── test_config.py               # settings defaults, env loading, LogLevel validation
+├── test_app.py                  # OpenAPI schema, run(), lifespan wiring tests
+├── test_audio_decoder.py        # audio decoder success, sample rate, error paths
+├── test_sessions.py             # POST/DELETE session REST contract
+├── test_auth.py                 # Bearer auth enforcement on /v1/*
+├── test_whisper_service.py      # build_initial_prompt + mocked transcribe tests
+├── test_preload_whisper_model.py # GPU build-time preload script (cache check, CPU/int8)
+└── test_docker_config.py        # docker-compose / Dockerfile / .dockerignore integration
 ```
 
 ## Test
@@ -90,6 +92,8 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
 | `test_auth.py` | Bearer auth enforced on `/v1/*` when `STT_API_KEY` set; skipped when empty |
 | `test_whisper_service.py` | `build_initial_prompt` logic, mocked `WhisperModel.load`/`transcribe`, beam size/VAD kwargs, empty/multi-dim input handling |
+| `test_preload_whisper_model.py` | GPU build-time preload: `_expected_cache_dir()` paths, `main()` CPU/int8 hardcoding, cache-miss exit code |
+| `test_docker_config.py` | `docker-compose.yml` shape, `Dockerfile` / `Dockerfile.gpu` defaults and preload ordering, `.dockerignore` patterns, real `docker compose config` validation |
 
 ## Lint
 
