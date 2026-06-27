@@ -125,8 +125,8 @@ async def stream_session(
         if webm_buffer:
             try:
                 await flush(force=True)
-            except (RuntimeError, WebSocketDisconnect):
-                logger.debug("trailing flush skipped; client disconnected")
+            except Exception:  # noqa: BLE001 - cleanup path must not mask in-flight errors
+                logger.debug("trailing flush skipped", exc_info=True)
 
 
 async def _transcribe_and_emit(
@@ -140,6 +140,11 @@ async def _transcribe_and_emit(
     if len(pcm) == 0:
         return
 
+    # Hold whisper_lock across transcribe AND the transcript read-modify-write.
+    # The mutation has no `await` today so the GIL keeps it atomic, but a
+    # future await between these statements would let two concurrent
+    # connections to the same session interleave and lose text. Locking
+    # makes the critical section unambiguously safe.
     async with whisper_lock:
         try:
             text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
@@ -150,18 +155,19 @@ async def _transcribe_and_emit(
             )
             return
 
-    if not text:
-        return
+        if not text:
+            return
 
-    if session.raw_transcript:
-        session.raw_transcript += " "
-    session.raw_transcript += text
-    session.partial_transcripts.append(text)
+        if session.raw_transcript:
+            session.raw_transcript += " "
+        session.raw_transcript += text
+        session.partial_transcripts.append(text)
+        cumulative = session.raw_transcript
 
     await websocket.send_json(
         {
             "type": "partial_transcript",
-            "text": session.raw_transcript,
+            "text": cumulative,
             "is_final": False,
         }
     )

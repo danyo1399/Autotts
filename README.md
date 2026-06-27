@@ -266,8 +266,23 @@ parallel calls), appends the new text to `session.raw_transcript`, and
 emits a `partial_transcript` event. Decode and transcribe run in
 `asyncio.to_thread` so the event loop is not blocked.
 
+The transcript read-modify-write happens **inside** the same lock, so two
+concurrent connections to the same session cannot interleave appends and
+lose text.
+
 On client disconnect the session and accumulated transcript are preserved;
 finalization happens via the REST API in subtask 7.
+
+### Deployment caveats
+
+- **API key in URL.** The `?token=<STT_API_KEY>` query string lands in
+  access logs (uvicorn, reverse proxies) and browser history. Prefer the
+  `Authorization: Bearer ...` header when the client supports it, and
+  suppress or redact query strings from production access logs.
+- **Single-process only.** `asyncio.Lock` and `InMemorySessionStore` are
+  per-process. `uvicorn --workers N` runs N independent states; the
+  Whisper lock and session dict are not shared across workers. Subtask 7
+  externalizes session state before horizontal scaling is meaningful.
 
 ## Configuration
 

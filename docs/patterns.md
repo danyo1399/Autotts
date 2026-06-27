@@ -202,6 +202,19 @@ and close with a WS-specific code.
 - Unknown sessions close with code `4404`.
 - When `STT_API_KEY` is empty, `check_ws_api_key` returns `True` and the
   handler proceeds (dev mode parity with REST).
+- Both the REST and WS paths compare keys with `hmac.compare_digest` to
+  avoid a timing side-channel on API-key guessing.
+
+### Query-string token exposure (deployment caveat)
+
+The `?token=<STT_API_KEY>` contract is locked by the spec, but a query
+string is recorded alongside the request line in many default access logs
+(uvicorn's access log, nginx/ALB access logs, browser history). Mitigations:
+
+- Prefer the `Authorization: Bearer ...` header when the client can set
+  headers on the WS handshake (the server accepts both).
+- In production, suppress or filter query strings from access logs (e.g.
+  `--no-access-log`, or a log formatter that redacts `?token=`).
 
 ## Blocking work off the event loop (`asyncio.to_thread`)
 
@@ -225,6 +238,14 @@ async with app.state.whisper_lock:
 `faster-whisper`'s model instance is not safe for concurrent transcribe
 calls, so an `asyncio.Lock` (`app.state.whisper_lock`, created in lifespan)
 serializes access across connections.
+
+**Multi-worker caveat.** `asyncio.Lock` is per-process. Deploying behind
+`uvicorn --workers N` (or any pre-fork model) loads the Whisper model once
+per worker, each with its own lock. That is correct — the model is not
+shared across processes, so no cross-worker lock is needed — but operators
+should not expect `app.state.whisper_lock` to serialize work across
+workers. Each worker also holds its own `session_store`; subtask 7 will
+need to externalize state before horizontal scaling is meaningful.
 
 ## WebSocket streaming flush logic
 

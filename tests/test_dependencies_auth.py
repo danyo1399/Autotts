@@ -3,7 +3,11 @@
 from unittest.mock import MagicMock
 
 from autobot_stt.config import Settings
-from autobot_stt.dependencies.auth import _extract_ws_token, check_ws_api_key
+from autobot_stt.dependencies.auth import (
+    _extract_ws_token,
+    _keys_match,
+    check_ws_api_key,
+)
 
 
 def _websocket(headers: dict[str, str] | None = None) -> MagicMock:
@@ -77,3 +81,30 @@ def test_check_ws_api_key_rejects_when_no_credential_provided() -> None:
     settings = Settings(stt_api_key="secret")
     ws = _websocket({})
     assert check_ws_api_key(ws, None, settings) is False
+
+
+# --- _keys_match (constant-time comparison) -------------------------------
+
+
+def test_keys_match_returns_true_for_equal_strings() -> None:
+    assert _keys_match("secret", "secret") is True
+
+
+def test_keys_match_returns_false_for_different_strings() -> None:
+    assert _keys_match("secret", "secre7") is False
+
+
+def test_keys_match_returns_false_when_provided_is_none() -> None:
+    assert _keys_match(None, "secret") is False
+
+
+def test_keys_match_returns_false_for_empty_provided_when_expected_nonempty() -> None:
+    # hmac.compare_digest("") on non-empty expected differs by length and
+    # returns False without raising.
+    assert _keys_match("", "secret") is False
+
+
+def test_keys_match_handles_unicode_keys() -> None:
+    # Both sides are utf-8 encoded; non-ASCII keys must compare correctly.
+    assert _keys_match("sëcret", "sëcret") is True
+    assert _keys_match("sëcret", "secret") is False
