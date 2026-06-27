@@ -213,6 +213,44 @@ def test_stream_decode_error_sends_error_event(
     mock_whisper.transcribe.assert_not_called()
 
 
+def test_stream_ffmpeg_missing_sends_error_event(
+    stream_client: TestClient,
+    mock_whisper: MagicMock,
+) -> None:
+    session_id = _create_session(stream_client)
+
+    with patch(
+        "autobot_stt.routes.stream.decode_webm_opus_to_pcm",
+        side_effect=FileNotFoundError("ffmpeg not found"),
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()
+            ws.send_bytes(_audio_chunk())
+            error_event = ws.receive_json()
+
+    assert error_event == {"type": "error", "message": "Audio decoder unavailable"}
+    mock_whisper.transcribe.assert_not_called()
+
+
+def test_stream_whisper_failure_sends_error_event(
+    stream_client: TestClient,
+    mock_whisper: MagicMock,
+    mock_pcm: np.ndarray,
+) -> None:
+    session_id = _create_session(stream_client)
+    mock_whisper.transcribe.side_effect = RuntimeError("model crashed")
+
+    with patch(
+        "autobot_stt.routes.stream.decode_webm_opus_to_pcm", return_value=mock_pcm
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()
+            ws.send_bytes(_audio_chunk())
+            error_event = ws.receive_json()
+
+    assert error_event == {"type": "error", "message": "Transcription failed"}
+
+
 def test_stream_incomplete_webm_buffers_without_error(
     stream_client: TestClient,
     mock_whisper: MagicMock,
