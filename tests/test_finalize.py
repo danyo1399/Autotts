@@ -133,6 +133,27 @@ async def test_finalize_missing_openai_key_returns_503(
     mock_cleanup.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_finalize_returns_empty_text_when_cleanup_yields_empty(
+    client, session_store, auth_headers, monkeypatch, mock_cleanup
+) -> None:
+    _set_openai_key(monkeypatch)
+    session_id = await _create_session_with_transcript(
+        client, session_store, "raw only", auth_headers=auth_headers
+    )
+    mock_cleanup.return_value = ""
+
+    response = await client.post(
+        f"/v1/sessions/{session_id}/finalize", headers=auth_headers
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["text"] == ""
+    assert payload["raw_transcript"] == "raw only"
+    assert await session_store.get(session_id) is None
+
+
 def _build_session() -> Session:
     return Session(
         id="s1",
@@ -207,3 +228,65 @@ async def test_cleanup_transcript_empty_choices_returns_empty_string() -> None:
         )
 
     assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_cleanup_transcript_none_message_content_returns_empty_string() -> None:
+    client_mock = _mock_openai_client(content=None)
+
+    with patch.object(llm_cleanup, "AsyncOpenAI", return_value=client_mock):
+        result = await llm_cleanup.cleanup_transcript(
+            _build_session(), api_key="sk-test"
+        )
+
+    assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_cleanup_transcript_propagates_openai_error() -> None:
+    from openai import OpenAIError
+
+    client_mock = MagicMock()
+    client_mock.chat.completions.create = AsyncMock(
+        side_effect=OpenAIError("upstream failure")
+    )
+    client_mock.__aenter__ = AsyncMock(return_value=client_mock)
+    client_mock.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(llm_cleanup, "AsyncOpenAI", return_value=client_mock):
+        with pytest.raises(OpenAIError):
+            await llm_cleanup.cleanup_transcript(_build_session(), api_key="sk-test")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_transcript_passes_api_key_to_openai_client() -> None:
+    client_mock = _mock_openai_client(content="ok")
+
+    with patch.object(llm_cleanup, "AsyncOpenAI", return_value=client_mock) as ctor:
+        await llm_cleanup.cleanup_transcript(_build_session(), api_key="sk-secret")
+
+    ctor.assert_called_once_with(api_key="sk-secret")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_transcript_renders_empty_context_as_placeholders() -> None:
+    empty_session = Session(
+        id="s2",
+        draft_text="   ",
+        chat_history=[],
+        comments=[],
+        created_at=datetime.now(UTC),
+        raw_transcript="raw only",
+    )
+    client_mock = _mock_openai_client(content="ok")
+
+    with patch.object(llm_cleanup, "AsyncOpenAI", return_value=client_mock):
+        await llm_cleanup.cleanup_transcript(empty_session, api_key="sk-test")
+
+    user_content = client_mock.chat.completions.create.await_args.kwargs["messages"][
+        1
+    ]["content"]
+    assert "(empty)" in user_content
+    assert "(none)" in user_content
+    assert user_content.count("(none)") == 2
+    assert "raw only" in user_content

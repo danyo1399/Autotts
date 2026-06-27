@@ -86,7 +86,7 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_app.py` | OpenAPI schema shape, `run()` delegates to uvicorn with correct args |
 | `test_audio_decoder.py` | WebM/Opus decode to mono float32 PCM, sample-rate handling, error paths; skips when ffmpeg is absent |
 | `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
-| `test_finalize.py` | LLM finalize endpoint: success, 400/401/404/503, session deletion, OpenAI payload |
+| `test_finalize.py` | LLM finalize endpoint: success, 400/404/503, session deletion, empty-text response, OpenAI payload, `cleanup_transcript` unit tests (whitespace strip, empty choices, None content, error propagation, api_key passthrough, empty-context placeholders) |
 | `test_auth.py` | Bearer auth enforced on `/v1/*` when `STT_API_KEY` set; skipped when empty |
 
 ## Lint
