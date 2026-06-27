@@ -1,5 +1,6 @@
 """Tests for the WebSocket streaming endpoint (subtask 6)."""
 
+import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -343,3 +344,172 @@ def test_stream_passes_initial_prompt_to_whisper(
     mock_whisper.transcribe.assert_called_once()
     args, _kwargs = mock_whisper.transcribe.call_args
     assert args[1] == "meeting notes\nuser: hi there"
+
+
+def test_stream_ignores_text_frames(
+    stream_client: TestClient,
+    mock_whisper: MagicMock,
+    mock_pcm: np.ndarray,
+) -> None:
+    """Non-bytes (text) frames must be skipped, not crash or transcribe."""
+    session_id = _create_session(stream_client)
+
+    with patch(
+        "autobot_stt.routes.stream.decode_webm_opus_to_pcm", return_value=mock_pcm
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()  # ready
+            ws.send_text("ignore me")  # text frame -> message["bytes"] is None
+            ws.send_bytes(_audio_chunk())  # this one drives transcription
+            partial = ws.receive_json()
+
+    assert partial["type"] == "partial_transcript"
+    assert partial["text"] == "hello world"
+    mock_whisper.transcribe.assert_called_once()
+
+
+def test_stream_buffers_small_bytes_until_threshold_met(
+    stream_client: TestClient,
+    mock_whisper: MagicMock,
+    mock_pcm: np.ndarray,
+) -> None:
+    """Frames under STREAM_MIN_BYTES_FOR_DECODE accumulate without decoding."""
+    session_id = _create_session(stream_client)
+    decode_sizes: list[int] = []
+
+    def _track_decode(batch: bytes) -> np.ndarray:
+        decode_sizes.append(len(batch))
+        return mock_pcm
+
+    small_chunk = b"\x00" * (STREAM_MIN_BYTES_FOR_DECODE // 2)
+
+    with patch(
+        "autobot_stt.routes.stream.decode_webm_opus_to_pcm", side_effect=_track_decode
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()
+            ws.send_bytes(small_chunk)  # under threshold -> non-forced flush returns
+            # Second large frame pushes buffer over threshold and drives a real
+            # flush, giving us a synchronization point via receive_json().
+            ws.send_bytes(_audio_chunk())
+            partial = ws.receive_json()
+
+    # Only the combined-buffer flush decoded; the small-only flush was skipped.
+    assert partial["type"] == "partial_transcript"
+    assert decode_sizes == [STREAM_MIN_BYTES_FOR_DECODE // 2 + len(_audio_chunk())]
+    mock_whisper.transcribe.assert_called_once()
+
+
+def test_stream_small_pcm_defers_transcribe_until_threshold_met(
+    stream_client: TestClient,
+    mock_whisper: MagicMock,
+    mock_pcm: np.ndarray,
+) -> None:
+    """PCM under STREAM_FLUSH_SAMPLES skips transcription on non-forced flushes."""
+    session_id = _create_session(stream_client)
+    small_pcm = np.zeros(STREAM_FLUSH_SAMPLES - 1, dtype=np.float32)
+    decode_calls = 0
+
+    def _decode_side_effect(_batch: bytes) -> np.ndarray:
+        nonlocal decode_calls
+        decode_calls += 1
+        # First flush: small PCM under threshold -> non-forced flush skips.
+        # Second flush: threshold-meeting PCM -> emits, syncs the test.
+        return small_pcm if decode_calls == 1 else mock_pcm
+
+    with patch(
+        "autobot_stt.routes.stream.decode_webm_opus_to_pcm",
+        side_effect=_decode_side_effect,
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()
+            ws.send_bytes(_audio_chunk())  # small PCM -> line 93 returns early
+            ws.send_bytes(_audio_chunk())  # threshold PCM -> transcribe + emit
+            partial = ws.receive_json()
+
+    assert partial["type"] == "partial_transcript"
+    # Without line 93 the first flush would have transcribed too.
+    mock_whisper.transcribe.assert_called_once()
+
+
+def test_stream_empty_pcm_skips_transcribe(
+    stream_client: TestClient,
+    mock_whisper: MagicMock,
+    mock_pcm: np.ndarray,
+) -> None:
+    """Empty PCM reaching _transcribe_and_emit returns before calling whisper."""
+    session_id = _create_session(stream_client)
+    empty_pcm = np.zeros(0, dtype=np.float32)
+    decode_calls = 0
+
+    def _decode_side_effect(_batch: bytes) -> np.ndarray:
+        nonlocal decode_calls
+        decode_calls += 1
+        return empty_pcm if decode_calls == 1 else mock_pcm
+
+    # Patch the threshold to 0 so empty PCM passes the non-forced flush gate and
+    # reaches _transcribe_and_emit where line 141 returns early.
+    with (
+        patch(
+            "autobot_stt.routes.stream.decode_webm_opus_to_pcm",
+            side_effect=_decode_side_effect,
+        ),
+        patch("autobot_stt.routes.stream.STREAM_FLUSH_SAMPLES", 0),
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()
+            ws.send_bytes(_audio_chunk())  # empty PCM -> _transcribe_and_emit skips
+            ws.send_bytes(_audio_chunk())  # normal PCM -> transcribe + emit
+            partial = ws.receive_json()
+
+    assert partial["type"] == "partial_transcript"
+    # Second flush is what called transcribe; first flush's empty PCM did not.
+    mock_whisper.transcribe.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stream_empty_transcript_skips_emit_and_accumulation(
+    stream_client: TestClient,
+    session_store: InMemorySessionStore,
+    mock_whisper: MagicMock,
+    mock_pcm: np.ndarray,
+) -> None:
+    """Whisper returning empty text skips emit and transcript accumulation."""
+    session_id = _create_session(stream_client)
+    mock_whisper.transcribe.side_effect = ["", "real text"]
+
+    with patch(
+        "autobot_stt.routes.stream.decode_webm_opus_to_pcm", return_value=mock_pcm
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()
+            ws.send_bytes(_audio_chunk())  # whisper returns "" -> no emit
+            ws.send_bytes(_audio_chunk())  # whisper returns "real text" -> emit
+            partial = ws.receive_json()
+
+    assert partial["type"] == "partial_transcript"
+    assert partial["text"] == "real text"
+    assert mock_whisper.transcribe.call_count == 2
+    stored = await _get_session(session_store, session_id)
+    assert stored.raw_transcript == "real text"
+    assert stored.partial_transcripts == ["real text"]
+
+
+def test_stream_silence_timeout_on_empty_buffer_no_decode(
+    stream_client: TestClient,
+    mock_whisper: MagicMock,
+) -> None:
+    """Silence timeout firing on an empty buffer is a no-op (no decode, no error)."""
+    session_id = _create_session(stream_client)
+
+    with (
+        patch("autobot_stt.routes.stream.decode_webm_opus_to_pcm") as decode_mock,
+        patch("autobot_stt.routes.stream.STREAM_SILENCE_TIMEOUT_SECONDS", 0.01),
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()  # ready
+            # Allow at least one silence-timeout tick to fire on empty buffer.
+            time.sleep(0.05)
+
+    decode_mock.assert_not_called()
+    mock_whisper.transcribe.assert_not_called()

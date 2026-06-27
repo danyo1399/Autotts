@@ -69,6 +69,9 @@ tests/
 ├── test_audio_decoder.py   # audio decoder success, sample rate, error paths
 ├── test_sessions.py        # POST/DELETE session REST contract
 ├── test_auth.py            # Bearer auth enforcement on /v1/*
+├── test_dependencies_auth.py  # WebSocket auth helpers: token extraction, key validation
+├── test_dependencies_store.py # DI accessors: session store, whisper service/lock errors
+├── test_stream.py          # WebSocket streaming endpoint integration tests
 └── test_whisper_service.py # build_initial_prompt + mocked transcribe tests
 ```
 
@@ -89,8 +92,10 @@ and `httpx.AsyncClient` with `ASGITransport` for the FastAPI app.
 | `test_audio_decoder.py` | WebM/Opus decode to mono float32 PCM, sample-rate handling, error paths; skips when ffmpeg is absent |
 | `test_sessions.py` | Session create/delete REST contract, persistence, defaults, 422 on bad input |
 | `test_auth.py` | Bearer auth enforced on `/v1/*` when `STT_API_KEY` set; skipped when empty |
+| `test_dependencies_auth.py` | `_extract_ws_token` precedence/normalization, `check_ws_api_key` bypass/match/reject |
+| `test_dependencies_store.py` | `get_session_store` happy path, `get_whisper_service`/`get_whisper_lock` happy + `RuntimeError` on missing state |
 | `test_whisper_service.py` | `build_initial_prompt` logic, mocked `WhisperModel.load`/`transcribe`, beam size/VAD kwargs, empty/multi-dim input handling |
-| `test_stream.py` | WebSocket streaming: `ready` handshake, partial transcripts, auth (4401 on failure, token query/Bearer), 4404 unknown session, decode error events |
+| `test_stream.py` | WebSocket streaming: `ready` handshake, partial transcripts (incremental + cumulative), auth (4401, query-token, Bearer-header, key-empty bypass), 4404 unknown session, decode/ffmpeg/whisper error events, threshold-gated flushes, text-frame ignore, silence-timeout no-op |
 
 ## Lint
 
