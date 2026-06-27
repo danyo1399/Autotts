@@ -61,23 +61,38 @@ def test_expected_cache_dir_falls_back_to_default(
 # HF_HOME.
 
 
-def test_main_invokes_whisper_with_cpu_and_int8_regardless_of_device_env(
-    preload_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("model_env", "expected_model", "set_cuda_device_env"),
+    [
+        # Regression guard: WHISPER_DEVICE=cuda must be ignored so docker build
+        # works on GPU-less hosts (commit 4079b6a).
+        pytest.param("small", "small", True, id="ignores-cuda-device-env"),
+        pytest.param(None, "small", False, id="defaults-to-small"),
+        pytest.param("base", "base", False, id="passes-model-override"),
+    ],
+)
+def test_main_calls_whisper_with_cpu_int8(
+    preload_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    model_env: str | None,
+    expected_model: str,
+    set_cuda_device_env: bool,
 ) -> None:
-    """Preload must always use CPU + int8 so ``docker build`` works without a GPU.
-
-    Regression guard: if a future refactor reads ``WHISPER_DEVICE`` at preload
-    time, the build would fail on GPU-less CI/hosts.
-    """
+    """main() always invokes WhisperModel with CPU + int8, regardless of env vars."""
     monkeypatch.setenv("HF_HOME", str(tmp_path))
-    monkeypatch.setenv("WHISPER_MODEL", "small")
-    monkeypatch.setenv("WHISPER_DEVICE", "cuda")  # must be ignored by preload
-    _make_cache_dir(tmp_path, "small")
+    if model_env is None:
+        monkeypatch.delenv("WHISPER_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("WHISPER_MODEL", model_env)
+    if set_cuda_device_env:
+        monkeypatch.setenv("WHISPER_DEVICE", "cuda")
+    _make_cache_dir(tmp_path, expected_model)
 
     with patch.object(preload_module, "WhisperModel") as mock_cls:
-        preload_module.main()
+        preload_module.main()  # must not raise SystemExit
 
-    mock_cls.assert_called_once_with("small", device="cpu", compute_type="int8")
+    mock_cls.assert_called_once_with(expected_model, device="cpu", compute_type="int8")
 
 
 def test_main_exits_nonzero_when_cache_dir_missing(
@@ -92,41 +107,3 @@ def test_main_exits_nonzero_when_cache_dir_missing(
             preload_module.main()
 
     assert exc_info.value.code == 1
-
-
-def test_main_completes_when_cache_dir_present(
-    preload_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("HF_HOME", str(tmp_path))
-    monkeypatch.setenv("WHISPER_MODEL", "small")
-    _make_cache_dir(tmp_path, "small")
-
-    with patch.object(preload_module, "WhisperModel"):
-        preload_module.main()  # must not raise SystemExit
-
-
-def test_main_defaults_whisper_model_to_small(
-    preload_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Without WHISPER_MODEL set, main() defaults to ``small`` (matches Dockerfile.gpu)."""
-    monkeypatch.setenv("HF_HOME", str(tmp_path))
-    monkeypatch.delenv("WHISPER_MODEL", raising=False)
-    _make_cache_dir(tmp_path, "small")
-
-    with patch.object(preload_module, "WhisperModel") as mock_cls:
-        preload_module.main()
-
-    mock_cls.assert_called_once_with("small", device="cpu", compute_type="int8")
-
-
-def test_main_passes_through_whisper_model_override(
-    preload_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("HF_HOME", str(tmp_path))
-    monkeypatch.setenv("WHISPER_MODEL", "base")
-    _make_cache_dir(tmp_path, "base")
-
-    with patch.object(preload_module, "WhisperModel") as mock_cls:
-        preload_module.main()
-
-    mock_cls.assert_called_once_with("base", device="cpu", compute_type="int8")
