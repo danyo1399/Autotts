@@ -132,5 +132,7 @@ class WhisperService:
 
         segments, _info = self._model.transcribe(audio, **transcribe_kwargs)
         return " ".join(
-            segment.text.strip() for segment in segments if segment.text.strip()
+            stripped
+            for segment in segments
+            if (stripped := segment.text.strip())
         )

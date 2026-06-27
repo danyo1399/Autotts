@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["debug", "info", "warning", "error", "critical"]
+WhisperDevice = Literal["cpu", "cuda"]
 
 
 class Settings(BaseSettings):
@@ -16,7 +17,7 @@ class Settings(BaseSettings):
     stt_api_key: str = ""
     openai_api_key: str = ""
     whisper_model: str = "base"
-    whisper_device: str = "cpu"
+    whisper_device: WhisperDevice = "cpu"
     log_level: LogLevel = "info"
 
 
