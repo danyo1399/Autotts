@@ -154,6 +154,36 @@ async def test_finalize_openai_error_returns_502_and_keeps_session(
 
 
 @pytest.mark.asyncio
+async def test_finalize_uses_transcript_snapshot_during_cleanup(
+    client, session_store, auth_headers, monkeypatch, mock_cleanup
+) -> None:
+    """Concurrent stream mutations must not change the transcript sent to cleanup."""
+    _set_openai_key(monkeypatch)
+    session_id = await _create_session_with_transcript(
+        client, session_store, "hello whisper", auth_headers=auth_headers
+    )
+
+    captured_transcripts: list[str] = []
+
+    async def _mutate_and_return(session, *, api_key: str) -> str:
+        captured_transcripts.append(session.raw_transcript)
+        session.raw_transcript = "mutated during cleanup"
+        return "cleaned text"
+
+    mock_cleanup.side_effect = _mutate_and_return
+
+    response = await client.post(
+        f"/v1/sessions/{session_id}/finalize", headers=auth_headers
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["raw_transcript"] == "hello whisper"
+    assert payload["text"] == "cleaned text"
+    assert captured_transcripts == ["hello whisper"]
+
+
+@pytest.mark.asyncio
 async def test_finalize_returns_empty_text_when_cleanup_yields_empty(
     client, session_store, auth_headers, monkeypatch, mock_cleanup
 ) -> None:

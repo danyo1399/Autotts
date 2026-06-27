@@ -468,6 +468,33 @@ def test_stream_empty_pcm_skips_transcribe(
 
 
 @pytest.mark.asyncio
+async def test_stream_stops_accumulating_after_session_deleted(
+    stream_client: TestClient,
+    session_store: InMemorySessionStore,
+    mock_whisper: MagicMock,
+    mock_pcm: np.ndarray,
+) -> None:
+    """Deleting a session mid-stream must not append further transcript text."""
+    session_id = _create_session(stream_client)
+    mock_whisper.transcribe.side_effect = ["first chunk", "second chunk"]
+
+    with patch(
+        "autobot_stt.routes.stream.decode_webm_opus_to_pcm", return_value=mock_pcm
+    ):
+        with stream_client.websocket_connect(f"/v1/sessions/{session_id}/stream") as ws:
+            ws.receive_json()
+            ws.send_bytes(_audio_chunk())
+            first = ws.receive_json()
+            assert first["text"] == "first chunk"
+
+            await session_store.delete(session_id)
+            ws.send_bytes(_audio_chunk())
+
+    assert mock_whisper.transcribe.call_count == 1
+    assert await session_store.get(session_id) is None
+
+
+@pytest.mark.asyncio
 async def test_stream_empty_transcript_skips_emit_and_accumulation(
     stream_client: TestClient,
     session_store: InMemorySessionStore,

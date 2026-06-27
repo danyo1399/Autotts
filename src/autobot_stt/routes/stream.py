@@ -60,12 +60,16 @@ async def stream_session(
     initial_prompt = _build_initial_prompt(session)
     webm_buffer: bytearray = bytearray()
 
-    async def flush(force: bool) -> None:
-        """Decode buffered WebM; transcribe and emit when threshold met or ``force``."""
+    async def flush(force: bool) -> bool:
+        """Decode buffered WebM; transcribe and emit when threshold met or ``force``.
+
+        Returns False when the session was removed (finalize/delete); callers
+        should stop streaming.
+        """
         if not webm_buffer:
-            return
+            return True
         if not force and len(webm_buffer) < STREAM_MIN_BYTES_FOR_DECODE:
-            return
+            return True
 
         batch = bytes(webm_buffer)
         try:
@@ -74,27 +78,33 @@ async def stream_session(
             if not force:
                 # MediaRecorder fragments may not decode until more bytes arrive.
                 logger.debug("audio decode deferred (incomplete batch): %s", exc)
-                return
+                return True
             logger.warning("audio decode failed: %s", exc)
             webm_buffer.clear()
             await websocket.send_json(
                 {"type": "error", "message": "Failed to decode audio"}
             )
-            return
+            return True
         except FileNotFoundError:
             logger.error("ffmpeg unavailable; cannot decode audio")
             webm_buffer.clear()
             await websocket.send_json(
                 {"type": "error", "message": "Audio decoder unavailable"}
             )
-            return
+            return True
 
         if not force and len(pcm) < STREAM_FLUSH_SAMPLES:
-            return
+            return True
 
         webm_buffer.clear()
-        await _transcribe_and_emit(
-            pcm, websocket, whisper, whisper_lock, session, initial_prompt
+        return await _transcribe_and_emit(
+            pcm,
+            websocket,
+            whisper,
+            whisper_lock,
+            session,
+            store,
+            initial_prompt,
         )
 
     try:
@@ -105,7 +115,8 @@ async def stream_session(
                     timeout=STREAM_SILENCE_TIMEOUT_SECONDS,
                 )
             except TimeoutError:
-                await flush(force=True)
+                if not await flush(force=True):
+                    break
                 continue
 
             if message["type"] == "websocket.disconnect":
@@ -116,7 +127,8 @@ async def stream_session(
                 continue
 
             webm_buffer.extend(bytes_data)
-            await flush(force=False)
+            if not await flush(force=False):
+                break
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -135,10 +147,15 @@ async def _transcribe_and_emit(
     whisper: WhisperService,
     whisper_lock: asyncio.Lock,
     session: Session,
+    store: SessionStore,
     initial_prompt: str | None,
-) -> None:
+) -> bool:
+    """Transcribe PCM and emit a partial transcript.
+
+    Returns False when the session was removed from the store (finalize/delete).
+    """
     if len(pcm) == 0:
-        return
+        return True
 
     # Hold whisper_lock across transcribe AND the transcript read-modify-write.
     # The mutation has no `await` today so the GIL keeps it atomic, but a
@@ -146,6 +163,9 @@ async def _transcribe_and_emit(
     # connections to the same session interleave and lose text. Locking
     # makes the critical section unambiguously safe.
     async with whisper_lock:
+        if await store.get(session.id) is None:
+            return False
+
         try:
             text = await asyncio.to_thread(whisper.transcribe, pcm, initial_prompt)
         except Exception:  # noqa: BLE001 - log and recover, do not crash stream
@@ -153,10 +173,13 @@ async def _transcribe_and_emit(
             await websocket.send_json(
                 {"type": "error", "message": "Transcription failed"}
             )
-            return
+            return True
 
         if not text:
-            return
+            return True
+
+        if await store.get(session.id) is None:
+            return False
 
         if session.raw_transcript:
             session.raw_transcript += " "
@@ -171,6 +194,7 @@ async def _transcribe_and_emit(
             "is_final": False,
         }
     )
+    return True
 
 
 def _build_initial_prompt(session: Session) -> str | None:

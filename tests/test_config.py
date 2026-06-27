@@ -53,3 +53,8 @@ def test_settings_ignores_extra_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_log_level_rejects_invalid_value() -> None:
     with pytest.raises(ValidationError):
         Settings(log_level="invalid")  # type: ignore[arg-type]
+
+
+def test_whisper_device_rejects_invalid_value() -> None:
+    with pytest.raises(ValidationError):
+        Settings(whisper_device="invalid")  # type: ignore[arg-type]

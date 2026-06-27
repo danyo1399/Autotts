@@ -85,8 +85,12 @@ async def finalize_session(
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
     raw_transcript = session.raw_transcript
+    # Snapshot so concurrent streaming cannot mutate the transcript mid-cleanup.
+    cleanup_session = session.model_copy(update={"raw_transcript": raw_transcript})
     try:
-        cleaned = await cleanup_transcript(session, api_key=settings.openai_api_key)
+        cleaned = await cleanup_transcript(
+            cleanup_session, api_key=settings.openai_api_key
+        )
     except OpenAIError as exc:
         raise HTTPException(
             status_code=502,
